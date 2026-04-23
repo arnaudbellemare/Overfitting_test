@@ -128,8 +128,10 @@ def strategy_returns_from_labels(prices, labels, tc_bps=10):
     strat_rets = pos * asset_rets
 
     # Transaction costs on every position change
+    # Prepend initial zero position to correctly detect entry at the very first bar
     position_changes = np.abs(np.diff(np.concatenate(([0.0], pos)))) > 0
-    strat_rets[position_changes[1:]] -= tc_bps / 10000.0
+    # position_changes now has exactly the same length as strat_rets (N-1)
+    strat_rets[position_changes] -= tc_bps / 10000.0
     return strat_rets
 
 
