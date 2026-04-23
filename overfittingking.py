@@ -6,16 +6,15 @@ import pywt
 st.set_page_config(page_title="Wavelet Auto-Labeling Overfitting Test", layout="wide")
 st.title("🌊 Causal Wavelet + Auto-Labeling Overfitting Check")
 st.markdown("""
-This app performs a **bootstrap-based overfitting test** for the **causal wavelet denoising + trend auto-labeling** strategy 
-(from your Streamlit dashboard Tab 3).  
-
-It answers: *Is the best performance we get by tuning the causal window size real, or just data-mining luck?*
+**Now with transaction costs + true Out-of-Sample evaluation**  
+This version greatly reduces the chance of seeing inflated Sharpes due to overfitting.
 """)
 
 # ==============================================================================
-# Helper Functions
+# HELPER FUNCTIONS
 # ==============================================================================
 def simulate_gbm_prices(nobs, mu_annual, vol_annual, s0=100.0, periods_per_year=252, seed=None):
+    """Simulate GBM price series."""
     rng = np.random.default_rng(seed)
     dt = 1.0 / periods_per_year
     drift = (mu_annual - 0.5 * vol_annual ** 2) * dt
@@ -28,13 +27,15 @@ def simulate_gbm_prices(nobs, mu_annual, vol_annual, s0=100.0, periods_per_year=
 
 
 def sharpe_ratio(rets, periods_per_year=252):
+    """Annualized Sharpe (rf = 0)."""
     sd = np.std(rets, ddof=1)
-    if sd == 0.0 or np.isnan(sd):
+    if sd == 0 or np.isnan(sd):
         return np.nan
     return np.sqrt(periods_per_year) * np.mean(rets) / sd
 
 
 def rogers_satchell_volatility_approx(prices):
+    """Close-only volatility proxy used as threshold w."""
     if len(prices) < 2:
         return 0.01
     log_rets = np.log(prices[1:] / prices[:-1])
@@ -61,7 +62,7 @@ def causal_wavelet_denoise(prices_tuple, window_size):
 
 
 def auto_labeling(data_tuple, timestamp_tuple, w):
-    """Same trend auto-labeling logic as your dashboard."""
+    """Exact same trend auto-labeling logic as your original dashboard."""
     data_list = np.asarray(data_tuple).flatten()
     timestamps = pd.Series(timestamp_tuple)
 
@@ -82,50 +83,75 @@ def auto_labeling(data_tuple, timestamp_tuple, w):
 
     for i in range(n):
         if data_list[i] > FP + FP * w:
-            x_H = data_list[i]; HT = timestamps[i]; FP_N = i; Cid = 1; break
+            x_H = data_list[i]
+            HT = timestamps[i]
+            FP_N = i
+            Cid = 1
+            break
         if data_list[i] < FP - FP * w:
-            x_L = data_list[i]; LT = timestamps[i]; FP_N = i; Cid = -1; break
+            x_L = data_list[i]
+            LT = timestamps[i]
+            FP_N = i
+            Cid = -1
+            break
 
     for i in range(max(FP_N, 1), n):
         if Cid > 0:
             if data_list[i] > x_H:
-                x_H = data_list[i]; HT = timestamps[i]
+                x_H = data_list[i]
+                HT = timestamps[i]
             if data_list[i] < x_H - x_H * w and LT < HT:
                 mask = ((timestamps > LT) & (timestamps <= HT)).values
                 labels[mask] = 1
-                x_L = data_list[i]; LT = timestamps[i]; Cid = -1
+                x_L = data_list[i]
+                LT = timestamps[i]
+                Cid = -1
         elif Cid < 0:
             if data_list[i] < x_L:
-                x_L = data_list[i]; LT = timestamps[i]
+                x_L = data_list[i]
+                LT = timestamps[i]
             if data_list[i] > x_L + x_L * w and HT <= LT:
                 mask = ((timestamps > HT) & (timestamps <= LT)).values
                 labels[mask] = -1
-                x_H = data_list[i]; HT = timestamps[i]; Cid = 1
+                x_H = data_list[i]
+                HT = timestamps[i]
+                Cid = 1
 
     labels = np.where(labels == 0, Cid, labels)
     return labels
 
 
-def strategy_returns_from_labels(prices, labels):
+def strategy_returns_from_labels(prices, labels, tc_bps=10):
+    """Compute strategy returns with one-bar lag + transaction costs."""
     asset_rets = prices[1:] / prices[:-1] - 1.0
-    pos = labels[:-1]  # one-bar lag → causal
-    return pos * asset_rets
+    pos = labels[:-1]  # causal lag
+    strat_rets = pos * asset_rets
+
+    # Transaction costs on every position change
+    position_changes = np.abs(np.diff(np.concatenate(([0.0], pos)))) > 0
+    strat_rets[position_changes[1:]] -= tc_bps / 10000.0
+    return strat_rets
 
 
-def test_wavelet_range(prices, window_sizes, periods_per_year=252):
+def evaluate_single_window(prices, window_size, tc_bps, periods_per_year=252):
+    """Evaluate one fixed window (used for OOS and final reporting)."""
+    if window_size >= len(prices):
+        return np.nan
+    denoised = causal_wavelet_denoise(tuple(prices), window_size)
+    w = rogers_satchell_volatility_approx(prices)
+    idx = np.arange(len(prices))
+    labels = auto_labeling(tuple(denoised), tuple(idx), w)
+    strat_rets = strategy_returns_from_labels(prices, labels, tc_bps)
+    return sharpe_ratio(strat_rets, periods_per_year)
+
+
+def test_wavelet_range(prices, window_sizes, tc_bps, periods_per_year=252):
+    """Optimize over window sizes (used on training data only)."""
     sharpes = np.full(len(window_sizes), np.nan, dtype=float)
-
     for i, window in enumerate(window_sizes):
         if window >= len(prices):
             continue
-        denoised = causal_wavelet_denoise(tuple(prices), window)
-        w = rogers_satchell_volatility_approx(prices)
-        idx = np.arange(len(prices))
-        labels = auto_labeling(tuple(denoised), tuple(idx), w)
-
-        strat_rets = strategy_returns_from_labels(prices, labels)
-        sharpes[i] = sharpe_ratio(strat_rets, periods_per_year)
-
+        sharpes[i] = evaluate_single_window(prices, window, tc_bps, periods_per_year)
     imax = np.nanargmax(sharpes)
     return {
         "windows": np.array(window_sizes, dtype=int),
@@ -136,6 +162,7 @@ def test_wavelet_range(prices, window_sizes, periods_per_year=252):
 
 
 def prices_from_resampled_returns(base_prices, rng):
+    """Bootstrap: resample returns with replacement."""
     orig_rets = base_prices[1:] / base_prices[:-1] - 1.0
     boot_rets = rng.choice(orig_rets, size=orig_rets.size, replace=True)
     prices = np.empty(base_prices.size, dtype=float)
@@ -145,108 +172,142 @@ def prices_from_resampled_returns(base_prices, rng):
 
 
 # ==============================================================================
-# Sidebar Configuration
+# SIDEBAR
 # ==============================================================================
 st.sidebar.header("⚙️ Simulation & Test Settings")
 
-nobs = st.sidebar.slider("Number of observations (bars)", 300, 2000, 500, step=50)
-mu_annual = st.sidebar.slider("Annual drift (μ)", 0.0, 0.30, 0.10, 0.01)
-vol_annual = st.sidebar.slider("Annual volatility (σ)", 0.10, 0.60, 0.30, 0.01)
+nobs = st.sidebar.slider("Number of bars (observations)", 500, 5000, 2000, step=100)
+mu_annual = st.sidebar.slider("Annual drift μ", 0.0, 0.30, 0.10, 0.01)
+vol_annual = st.sidebar.slider("Annual volatility σ", 0.10, 0.60, 0.30, 0.01)
+tc_bps = st.sidebar.slider("Transaction cost (bps round-trip)", 0, 30, 10, step=1)
 
-window_min = st.sidebar.slider("Min causal window size", 32, 128, 64, step=16)
-window_max = st.sidebar.slider("Max causal window size", 128, 512, 384, step=16)
+use_oos = st.sidebar.checkbox("✅ Use true Out-of-Sample split (highly recommended)", value=True)
+oos_pct = st.sidebar.slider("Out-of-Sample %", 20, 40, 30, step=5) if use_oos else 0
+
+window_min = st.sidebar.slider("Min causal window size", 64, 256, 128, step=32)
+window_max = st.sidebar.slider("Max causal window size", 192, 512, 384, step=32)
 window_step = st.sidebar.slider("Window step size", 16, 64, 32, step=16)
-
-n_boot = st.sidebar.slider("Bootstrap replications", 500, 5000, 2000, step=500)
-periods_per_year = 252
-seed = 12345
+n_boot = st.sidebar.slider("Bootstrap replications", 500, 3000, 1000, step=500)
 
 window_sizes = np.arange(window_min, window_max + 1, window_step)
 
 if len(window_sizes) == 0 or window_sizes.max() >= nobs:
-    st.error("Invalid window range – max window must be smaller than number of observations.")
+    st.error("Window range is invalid. Max window must be smaller than number of bars.")
     st.stop()
 
 # ==============================================================================
-# Run Button
+# RUN BUTTON
 # ==============================================================================
-if st.button("🚀 Run Overfitting Test", type="primary"):
+if st.button("🚀 Run Full Overfitting Test", type="primary"):
+    seed = 12345
     rng = np.random.default_rng(seed)
 
-    with st.spinner("Simulating price series and running real-data test..."):
+    with st.spinner("Generating price series and running optimization..."):
         prices = simulate_gbm_prices(nobs, mu_annual, vol_annual, seed=seed)
-        result_real = test_wavelet_range(prices, window_sizes, periods_per_year)
 
-    progress_bar = st.progress(0, text="Running bootstrap replications...")
+        # Split into train / test if OOS is enabled
+        if use_oos:
+            split_idx = int(len(prices) * (1 - oos_pct / 100))
+            train_prices = prices[:split_idx]
+            test_prices = prices[split_idx:]
+        else:
+            train_prices = prices
+            test_prices = None
+
+        # Optimize only on training data
+        result_train = test_wavelet_range(train_prices, window_sizes, tc_bps)
+
+        # Evaluate best window on full series and on OOS
+        full_sharpe = evaluate_single_window(prices, result_train["best_window"], tc_bps)
+        oos_sharpe = evaluate_single_window(test_prices, result_train["best_window"], tc_bps) if use_oos else np.nan
+
+    # ==============================================================================
+    # BOOTSTRAP (only on training portion)
+    # ==============================================================================
+    progress_bar = st.progress(0, text="Running bootstrap on training data...")
     best_boot_sharpes = np.empty(n_boot, dtype=float)
-    best_boot_windows = np.empty(n_boot, dtype=int)
 
     for i in range(n_boot):
-        boot_prices = prices_from_resampled_returns(prices, rng)
-        result_boot = test_wavelet_range(boot_prices, window_sizes, periods_per_year)
+        boot_prices = prices_from_resampled_returns(train_prices, rng)
+        result_boot = test_wavelet_range(boot_prices, window_sizes, tc_bps)
         best_boot_sharpes[i] = result_boot["best_sharpe"]
-        best_boot_windows[i] = result_boot["best_window"]
 
         if (i + 1) % max(1, n_boot // 20) == 0:
-            progress_bar.progress((i + 1) / n_boot, text=f"Bootstrap {i+1}/{n_boot}...")
+            progress_bar.progress((i + 1) / n_boot)
 
     progress_bar.empty()
 
     # ==============================================================================
-    # Results
+    # RESULTS
     # ==============================================================================
-    p_value = np.mean(best_boot_sharpes >= result_real["best_sharpe"])
+    p_value = np.mean(best_boot_sharpes >= result_train["best_sharpe"])
     q50, q90, q95, q99 = np.quantile(best_boot_sharpes, [0.50, 0.90, 0.95, 0.99])
-    imax_boot = np.argmax(best_boot_sharpes)
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("📈 Original Simulated Series")
-        st.metric("Best causal window", f"{result_real['best_window']} bars")
-        st.metric("Best Sharpe ratio", f"{result_real['best_sharpe']:.4f}")
+        st.subheader("📈 Training Results (Optimization)")
+        st.metric("Best causal window", f"{result_train['best_window']} bars")
+        st.metric("Best Sharpe (train)", f"{result_train['best_sharpe']:.4f}")
 
     with col2:
-        st.subheader("📊 Bootstrap Distribution (Random Data)")
+        st.subheader("📊 Bootstrap (Random Training Data)")
         st.metric("Median best Sharpe", f"{q50:.4f}")
         st.metric("90th percentile", f"{q90:.4f}")
         st.metric("95th percentile", f"{q95:.4f}")
         st.metric("99th percentile", f"{q99:.4f}")
-        st.metric("p-value (Pr[random ≥ real])", f"{p_value:.4%}")
+        st.metric("p-value (random ≥ real)", f"{p_value:.1%}")
 
     st.markdown("---")
 
-    if result_real["best_sharpe"] > q95:
-        st.success("✅ The best Sharpe stands out significantly in the tail → possible genuine edge (still needs real-market validation).")
+    # True OOS result
+    if use_oos:
+        st.subheader("🔥 True Out-of-Sample Performance")
+        col_oos1, col_oos2 = st.columns(2)
+        col_oos1.metric("OOS Sharpe (best window)", f"{oos_sharpe:.4f}")
+        col_oos2.metric("Full-series Sharpe (for reference)", f"{full_sharpe:.4f}")
+
+    # Interpretation
+    if result_train["best_sharpe"] > q95:
+        st.success("✅ Best window stands out strongly → low risk of overfitting.")
     else:
-        st.warning("⚠️ The best Sharpe is **not unusual** compared to what parameter search finds on pure noise. Strong evidence of overfitting.")
+        st.warning("⚠️ The best Sharpe is **not unusual** compared to parameter search on pure noise. Strong evidence of overfitting.")
 
-    # Top windows on original data
+    # Top windows table
     topn = min(10, len(window_sizes))
-    idx = np.argsort(result_real["sharpes"])[::-1][:topn]
-
-    st.subheader(f"🏆 Top {topn} Causal Window Sizes on Original Series")
+    idx = np.argsort(result_train["sharpes"])[::-1][:topn]
+    st.subheader(f"🏆 Top {topn} Causal Window Sizes (Training Data)")
     df_top = pd.DataFrame({
-        "Causal Window": result_real["windows"][idx],
-        "Sharpe Ratio": result_real["sharpes"][idx]
+        "Causal Window": result_train["windows"][idx],
+        "Sharpe Ratio": result_train["sharpes"][idx]
     })
     st.dataframe(df_top.style.format({"Sharpe Ratio": "{:.4f}"}), use_container_width=True, hide_index=True)
 
     st.info("""
-    **Interpretation**:  
-    This test shows how much performance you can "manufacture" just by searching over different causal window sizes on random data.  
-    If your real-data best Sharpe is only around the median or 90th percentile of the bootstrap, the rule is likely overfit.
+    **How to avoid overfitting (what this app now does):**
+    • True OOS split (optimize only on first part)
+    • Realistic transaction costs
+    • Bootstrap only on training data
+    • Much larger dataset (2000+ bars recommended)
     """)
 
-    # Optional: Show all sharpes plot
-    if st.checkbox("Show Sharpe vs Window Size plot (original series)"):
+    # Optional equity curve for best window on OOS
+    if use_oos and st.checkbox("Show equity curve for best window on Out-of-Sample period"):
+        best_window = result_train["best_window"]
+        denoised = causal_wavelet_denoise(tuple(test_prices), best_window)
+        w = rogers_satchell_volatility_approx(test_prices)
+        idx = np.arange(len(test_prices))
+        labels = auto_labeling(tuple(denoised), tuple(idx), w)
+        strat_rets = strategy_returns_from_labels(test_prices, labels, tc_bps)
+        equity = np.cumprod(1 + strat_rets)
+
         fig_df = pd.DataFrame({
-            "Window Size": result_real["windows"],
-            "Sharpe": result_real["sharpes"]
+            "Bar": np.arange(len(equity)),
+            "Equity": equity
         })
-        st.line_chart(fig_df.set_index("Window Size"))
+        st.line_chart(fig_df.set_index("Bar"), use_container_width=True)
 
 else:
-    st.info("Adjust parameters in the sidebar and click **Run Overfitting Test** to begin.")
+    st.info("👈 Adjust settings in the sidebar and click **Run Full Overfitting Test**")
 
-st.caption("Built with causal wavelet denoising + auto-labeling from your dashboard. Uses 252 trading days/year and one-bar lag for causality.")
+st.caption("Causal wavelet denoising + trend auto-labeling • 252 trading days/year • Strictly causal • Transaction costs applied")
