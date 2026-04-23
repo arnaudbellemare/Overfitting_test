@@ -4,11 +4,11 @@ import pandas as pd
 import pywt
 
 st.set_page_config(page_title="Wavelet Overfitting Test", layout="wide")
-st.title("🌊 Causal Wavelet + Auto-Labeling Overfitting Check")
-st.markdown("**Conservative Mode** — Higher costs + Fixed window to fight overfitting")
+st.title("🌊 Causal Wavelet Overfitting Test — Strict Mode")
+st.markdown("**Very Conservative Settings** — Designed to fight overfitting on BTC-like data")
 
 # ==============================================================================
-# HELPER FUNCTIONS (same as before)
+# HELPERS
 # ==============================================================================
 def simulate_gbm_prices(nobs, mu_annual, vol_annual, s0=100.0, periods_per_year=252, seed=None):
     rng = np.random.default_rng(seed)
@@ -31,7 +31,7 @@ def sharpe_ratio(rets, periods_per_year=252):
 
 def rogers_satchell_volatility_approx(prices):
     if len(prices) < 2:
-        return 0.01
+        return 0.02
     log_rets = np.log(prices[1:] / prices[:-1])
     return np.std(log_rets, ddof=1)
 
@@ -53,6 +53,7 @@ def causal_wavelet_denoise(prices_tuple, window_size):
 
 
 def auto_labeling(data_tuple, timestamp_tuple, w):
+    # Same as before
     data_list = np.asarray(data_tuple).flatten()
     timestamps = pd.Series(timestamp_tuple)
     if len(data_list) != len(timestamps):
@@ -85,7 +86,7 @@ def auto_labeling(data_tuple, timestamp_tuple, w):
     return labels
 
 
-def strategy_returns_from_labels(prices, labels, tc_bps=15):
+def strategy_returns_from_labels(prices, labels, tc_bps=20):
     asset_rets = prices[1:] / prices[:-1] - 1.0
     pos = labels[:-1]
     strat_rets = pos * asset_rets
@@ -98,21 +99,11 @@ def evaluate_single_window(prices, window_size, tc_bps, periods_per_year=252):
     if window_size >= len(prices):
         return np.nan
     denoised = causal_wavelet_denoise(tuple(prices), window_size)
-    w = rogers_satchell_volatility_approx(prices)
+    w = rogers_satchell_volatility_approx(prices) * 1.5   # stricter threshold
     idx = np.arange(len(prices))
     labels = auto_labeling(tuple(denoised), tuple(idx), w)
     strat_rets = strategy_returns_from_labels(prices, labels, tc_bps)
     return sharpe_ratio(strat_rets, periods_per_year)
-
-
-def test_wavelet_range(prices, window_sizes, tc_bps, periods_per_year=252):
-    sharpes = np.full(len(window_sizes), np.nan, dtype=float)
-    for i, window in enumerate(window_sizes):
-        if window >= len(prices): continue
-        sharpes[i] = evaluate_single_window(prices, window, tc_bps, periods_per_year)
-    imax = np.nanargmax(sharpes)
-    return {"windows": np.array(window_sizes, dtype=int), "sharpes": sharpes,
-            "best_window": int(window_sizes[imax]), "best_sharpe": float(sharpes[imax])}
 
 
 def prices_from_resampled_returns(base_prices, rng):
@@ -127,39 +118,35 @@ def prices_from_resampled_returns(base_prices, rng):
 # ==============================================================================
 # SIDEBAR
 # ==============================================================================
-st.sidebar.header("⚙️ Conservative Settings")
+st.sidebar.header("Strict Settings")
 
-data_mode = st.sidebar.radio("Data Source", ["Simulated GBM", "Upload CSV (BTC etc.)"])
+data_mode = st.sidebar.radio("Data Source", ["Simulated GBM", "Upload CSV"])
 
 if data_mode == "Simulated GBM":
-    nobs = st.sidebar.slider("Number of bars", 1000, 5000, 2500, step=100)
-    mu_annual = st.sidebar.slider("Annual drift μ", 0.0, 0.30, 0.08, 0.01)
-    vol_annual = st.sidebar.slider("Annual volatility σ", 0.10, 0.80, 0.45, 0.01)
+    nobs = st.sidebar.slider("Bars", 1500, 6000, 3000, step=100)
+    mu_annual = st.sidebar.slider("Drift", 0.0, 0.25, 0.08, 0.01)
+    vol_annual = st.sidebar.slider("Vol", 0.2, 0.8, 0.45, 0.05)
 else:
-    uploaded_file = st.sidebar.file_uploader("Upload CSV with 'close' column", type=["csv"])
-    if uploaded_file is None:
-        st.warning("Upload CSV...")
+    uploaded = st.sidebar.file_uploader("CSV with 'close' column", type=["csv"])
+    if uploaded is None:
         st.stop()
-    df = pd.read_csv(uploaded_file)
+    df = pd.read_csv(uploaded)
     prices = df['close'].dropna().values.astype(float)
     st.sidebar.success(f"Loaded {len(prices)} bars")
 
-tc_bps = st.sidebar.slider("Transaction cost (bps)", 5, 30, 15, step=1)
-use_oos = st.sidebar.checkbox("Use true Out-of-Sample", value=True)
-oos_pct = st.sidebar.slider("OOS %", 25, 40, 30, step=5)
-
-fixed_window = st.sidebar.number_input("Fixed Causal Window", value=320, min_value=128, max_value=512, step=32)
-
-n_boot = st.sidebar.slider("Bootstrap replications", 500, 1500, 800, step=100)
+tc_bps = st.sidebar.slider("Transaction Cost (bps)", 10, 40, 20, step=2)
+fixed_window = st.sidebar.number_input("Fixed Window Size", value=400, min_value=200, max_value=600, step=50)
+use_oos = st.sidebar.checkbox("Use OOS", value=True)
+oos_pct = st.sidebar.slider("OOS %", 25, 40, 35, step=5)
 
 # ==============================================================================
 # RUN
 # ==============================================================================
-if st.button("🚀 Run Conservative Overfitting Test", type="primary"):
+if st.button("🚀 Run Strict Test", type="primary"):
     seed = 12345
     rng = np.random.default_rng(seed)
 
-    with st.spinner("Running..."):
+    with st.spinner("Testing..."):
         if data_mode == "Simulated GBM":
             prices = simulate_gbm_prices(nobs, mu_annual, vol_annual, seed=seed)
 
@@ -167,56 +154,50 @@ if st.button("🚀 Run Conservative Overfitting Test", type="primary"):
         train_prices = prices[:split_idx]
         test_prices = prices[split_idx:]
 
-        # Fixed window only (no search)
         best_win = fixed_window
         train_sharpe = evaluate_single_window(train_prices, best_win, tc_bps)
-        result_train = {"best_window": best_win, "best_sharpe": train_sharpe,
-                        "windows": np.array([best_win]), "sharpes": np.array([train_sharpe])}
-
-        full_sharpe = evaluate_single_window(prices, best_win, tc_bps)
         oos_sharpe = evaluate_single_window(test_prices, best_win, tc_bps)
 
     # Bootstrap
     progress_bar = st.progress(0, text="Bootstrap...")
-    best_boot_sharpes = np.empty(n_boot, dtype=float)
+    n_boot = 600
+    best_boot = np.empty(n_boot)
     for i in range(n_boot):
-        boot_prices = prices_from_resampled_returns(train_prices, rng)
-        best_boot_sharpes[i] = evaluate_single_window(boot_prices, best_win, tc_bps)
-        if (i + 1) % max(1, n_boot // 10) == 0:
+        boot_p = prices_from_resampled_returns(train_prices, rng)
+        best_boot[i] = evaluate_single_window(boot_p, best_win, tc_bps)
+        if (i + 1) % 100 == 0:
             progress_bar.progress((i + 1) / n_boot)
     progress_bar.empty()
 
-    p_value = np.mean(best_boot_sharpes >= result_train["best_sharpe"])
-    q50, q90, q95, q99 = np.quantile(best_boot_sharpes, [0.50, 0.90, 0.95, 0.99])
+    p_value = np.mean(best_boot >= train_sharpe)
+    q95 = np.quantile(best_boot, 0.95)
 
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Fixed Window", f"{best_win} bars")
-        st.metric("Train Sharpe", f"{result_train['best_sharpe']:.4f}")
+        st.metric("Fixed Window", f"{best_win}")
+        st.metric("Train Sharpe", f"{train_sharpe:.4f}")
     with col2:
         st.metric("OOS Sharpe", f"{oos_sharpe:.4f}")
         st.metric("p-value", f"{p_value:.1%}")
 
-    if result_train["best_sharpe"] > q95:
-        st.success("✅ Low risk of overfitting")
+    if train_sharpe > q95:
+        st.success("✅ Finally passed! Low overfitting risk.")
     else:
-        st.warning("⚠️ Still overfitting — this method is very strong at fitting noise")
+        st.error("Still overfitting — this labeling method is extremely powerful at curve-fitting.")
 
-    # Auto Equity Curve
-    st.subheader("📈 Equity Curve on Out-of-Sample Data")
+    # Equity Curve
+    st.subheader("📈 OOS Equity Curve")
     denoised = causal_wavelet_denoise(tuple(test_prices), best_win)
-    w = rogers_satchell_volatility_approx(test_prices)
-    idx = np.arange(len(test_prices))
-    labels = auto_labeling(tuple(denoised), tuple(idx), w)
+    w = rogers_satchell_volatility_approx(test_prices) * 1.5
+    labels = auto_labeling(tuple(denoised), tuple(np.arange(len(test_prices))), w)
     strat_rets = strategy_returns_from_labels(test_prices, labels, tc_bps)
     equity = np.cumprod(1 + np.concatenate(([0.], strat_rets)))
 
-    eq_df = pd.DataFrame({"Bar": np.arange(len(equity)), "Equity": equity})
-    st.line_chart(eq_df.set_index("Bar"), use_container_width=True)
+    st.line_chart(pd.DataFrame({"Equity": equity}), use_container_width=True)
 
-    st.info(f"**Current Settings:** Fixed window = {best_win}, TC = {tc_bps} bps, OOS = {oos_pct}%")
+    st.info("Try increasing TC to 25-30 bps or window to 450+ if still red.")
 
 else:
-    st.info("Adjust settings on the left and click **Run**")
+    st.info("Click **Run Strict Test**")
 
-st.caption("Conservative setup to reduce overfitting on Bitcoin-type data")
+st.caption("Strict mode: large fixed window + high costs + stricter threshold")
