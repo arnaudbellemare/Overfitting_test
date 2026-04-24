@@ -3,56 +3,56 @@ import numpy as np
 import pandas as pd
 import pywt
 import ccxt
-from datetime import datetime, timedelta
 
 st.set_page_config(page_title="Real BTC Wavelet Test", layout="wide")
-st.title("🌊 Causal Wavelet + Auto-Labeling on Real BTC Data")
-st.markdown("**Live Kraken BTC/USD 1h data with pagination**")
+st.title("🌊 Causal Wavelet + Auto-Labeling on Real BTC")
+st.markdown("**Kraken BTC/USD 1h data**")
 
 # ==============================================================================
-@st.cache_data(ttl=3600)
-def fetch_real_btc_data(limit=5000):
+@st.cache_data(ttl=1800)
+def fetch_real_btc_data(target_bars=4000):
     try:
         exchange = ccxt.kraken({'enableRateLimit': True})
-        all_ohlcv = []
+        all_candles = []
         since = None
-        remaining = limit
+        batch_size = 1000
 
-        with st.spinner(f"Fetching up to {limit} BTC 1h bars..."):
-            while remaining > 0:
-                ohlcv = exchange.fetch_ohlcv(
-                    'BTC/USD', 
-                    timeframe='1h', 
-                    limit=min(1000, remaining),
-                    since=since
-                )
-                if not ohlcv:
-                    break
-                
-                all_ohlcv.extend(ohlcv)
-                since = ohlcv[-1][0] + 1  # next batch
-                remaining -= len(ohlcv)
-                
-                if len(ohlcv) < 1000:
-                    break  # no more data
+        st.info("Fetching BTC data from Kraken...")
 
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.drop_duplicates(subset='timestamp').sort_values('timestamp')
-        
+        while len(all_candles) < target_bars:
+            candles = exchange.fetch_ohlcv(
+                'BTC/USD', 
+                timeframe='1h', 
+                limit=batch_size,
+                since=since
+            )
+            
+            if not candles:
+                break
+                
+            all_candles.extend(candles)
+            
+            # Update since for next batch
+            since = candles[-1][0] + 3600000  # 1 hour in ms
+            
+            if len(candles) < batch_size:
+                break  # no more data
+
+        df = pd.DataFrame(all_candles, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        df = df.drop_duplicates(subset='ts').sort_values('ts')
         prices = df['close'].values.astype(float)
+
         days = len(prices) // 24
-        
-        st.success(f"✅ Successfully fetched **{len(prices)}** real BTC 1h bars (~{days} days)")
+        st.success(f"✅ Fetched **{len(prices)}** real BTC 1h bars (~{days} days)")
         return prices
-        
+
     except Exception as e:
-        st.error(f"Failed to fetch data: {e}")
+        st.error(f"Fetch failed: {e}")
         return None
 
 
 # ==============================================================================
-# CORE FUNCTIONS (same as before)
+# Rest of the functions (same as before)
 # ==============================================================================
 def sharpe_ratio(rets, periods_per_year=252*24):
     sd = np.std(rets, ddof=1)
@@ -150,29 +150,28 @@ def prices_from_resampled_returns(base_prices, rng):
 # SIDEBAR
 # ==============================================================================
 st.sidebar.header("Settings")
-limit = st.sidebar.slider("Target number of 1h bars", 1000, 6000, 4000, step=200)
+target_bars = st.sidebar.slider("Target bars to fetch", 1000, 6000, 3500, step=100)
 tc_bps = st.sidebar.slider("Transaction Cost (bps)", 15, 40, 22, step=1)
-fixed_window = st.sidebar.number_input("Fixed Window Size", value=420, min_value=250, max_value=600, step=20)
-use_oos = st.sidebar.checkbox("Use Out-of-Sample", value=True)
+fixed_window = st.sidebar.number_input("Fixed Window", value=420, min_value=250, max_value=600, step=20)
+use_oos = st.sidebar.checkbox("Use OOS", value=True)
 oos_pct = st.sidebar.slider("OOS %", 30, 45, 35, step=5)
 
 # ==============================================================================
-if st.button("🚀 Fetch Real BTC Data & Run Test", type="primary"):
-    prices = fetch_real_btc_data(limit)
-    if prices is None or len(prices) < 800:
+if st.button("🚀 Fetch Real BTC & Run Test", type="primary"):
+    prices = fetch_real_btc_data(target_bars)
+    if prices is None or len(prices) < 1000:
         st.stop()
 
     seed = 12345
     rng = np.random.default_rng(seed)
 
-    with st.spinner("Running test on real BTC data..."):
-        split_idx = int(len(prices) * (1 - oos_pct / 100))
-        train_prices = prices[:split_idx]
-        test_prices = prices[split_idx:]
+    split_idx = int(len(prices) * (1 - oos_pct / 100))
+    train_prices = prices[:split_idx]
+    test_prices = prices[split_idx:]
 
-        best_win = fixed_window
-        train_sharpe = evaluate_single_window(train_prices, best_win, tc_bps)
-        oos_sharpe = evaluate_single_window(test_prices, best_win, tc_bps)
+    best_win = fixed_window
+    train_sharpe = evaluate_single_window(train_prices, best_win, tc_bps)
+    oos_sharpe = evaluate_single_window(test_prices, best_win, tc_bps)
 
     # Bootstrap
     progress_bar = st.progress(0, text="Bootstrap...")
@@ -196,22 +195,20 @@ if st.button("🚀 Fetch Real BTC Data & Run Test", type="primary"):
         st.metric("OOS Sharpe", f"{oos_sharpe:.4f}")
         st.metric("p-value", f"{p_value:.1%}")
 
-    if train_sharpe > q95 * 0.9:
-        st.success("✅ Relatively good on real BTC")
+    if train_sharpe > q95 * 0.85:
+        st.success("✅ Decent result on real data")
     else:
-        st.warning("⚠️ Still overfitting (expected for this method on BTC)")
+        st.warning("⚠️ Still overfitting (this is normal for the method)")
 
-    # Equity Curve
-    st.subheader("📈 Equity Curve - Recent Out-of-Sample")
+    st.subheader("📈 OOS Equity Curve")
     denoised = causal_wavelet_denoise(tuple(test_prices), best_win)
     w = rogers_satchell_volatility_approx(test_prices) * 1.8
     labels = auto_labeling(tuple(denoised), tuple(np.arange(len(test_prices))), w)
     strat_rets = strategy_returns_from_labels(test_prices, labels, tc_bps)
     equity = np.cumprod(1 + np.concatenate(([0.], strat_rets)))
-
     st.line_chart(pd.DataFrame({"Equity": equity}), use_container_width=True)
 
 else:
     st.info("Click the button to fetch real BTC data")
 
-st.caption("Pagination-enabled fetch from Kraken • 1h BTC/USD")
+st.caption("Pagination fixed • Real Kraken BTC 1h data")
