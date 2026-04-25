@@ -6,13 +6,11 @@ import ccxt
 
 st.set_page_config(page_title="Real BTC Wavelet Test", layout="wide")
 st.title("🌊 Causal Wavelet + Auto-Labeling on Real BTC")
-st.markdown("**Live Kraken BTC/USD 1h data** • Fixed window • High costs")
+st.markdown("Live Kraken BTC/USD 1h data")
 
 # ==============================================================================
-# FETCH REAL BTC DATA
-# ==============================================================================
 @st.cache_data(ttl=1800)
-def fetch_real_btc_data(target_bars=3500):
+def fetch_real_btc_data(target_bars=4000):
     try:
         exchange = ccxt.kraken({'enableRateLimit': True})
         all_candles = []
@@ -22,7 +20,7 @@ def fetch_real_btc_data(target_bars=3500):
         with st.spinner("Fetching real BTC 1h data from Kraken..."):
             while len(all_candles) < target_bars:
                 candles = exchange.fetch_ohlcv('BTC/USD', '1h', limit=batch_size, since=since)
-                if not candles:
+                if not candles or len(candles) == 0:
                     break
                 all_candles.extend(candles)
                 since = candles[-1][0] + 3600000
@@ -140,7 +138,7 @@ def prices_from_resampled_returns(base_prices, rng):
 # SIDEBAR
 # ==============================================================================
 st.sidebar.header("Settings")
-target_bars = st.sidebar.slider("Target bars to fetch", 1500, 5000, 3500, step=100)
+target_bars = st.sidebar.slider("Target bars", 1500, 5000, 3500, step=100)
 tc_bps = st.sidebar.slider("Transaction Cost (bps)", 15, 40, 22, step=1)
 fixed_window = st.sidebar.number_input("Fixed Window Size", value=420, min_value=250, max_value=600, step=20)
 use_oos = st.sidebar.checkbox("Use Out-of-Sample", value=True)
@@ -148,11 +146,12 @@ oos_pct = st.sidebar.slider("OOS %", 30, 45, 35, step=5)
 
 # ==============================================================================
 if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
+    
     prices = fetch_real_btc_data(target_bars)
     if prices is None or len(prices) < 1000:
         st.stop()
 
-    st.info("✅ Data fetched. Starting full test...")
+    st.info("✅ Data fetched successfully. Now running the full test...")
 
     seed = 12345
     rng = np.random.default_rng(seed)
@@ -193,7 +192,6 @@ if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
     else:
         st.warning("⚠️ Still overfitting (common with this method)")
 
-    # Equity Curve
     st.subheader("📈 Equity Curve - Out-of-Sample Period")
     denoised = causal_wavelet_denoise(tuple(test_prices), best_win)
     w = rogers_satchell_volatility_approx(test_prices) * 1.8
@@ -203,6 +201,6 @@ if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
     st.line_chart(pd.DataFrame({"Equity": equity}), use_container_width=True)
 
 else:
-    st.info("Click the button above to fetch real BTC data and run the full test")
+    st.info("👆 Click the button to fetch real BTC data and run the full test")
 
 st.caption("Real BTC 1h data from Kraken • Fixed window strategy")
