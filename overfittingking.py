@@ -6,10 +6,10 @@ import ccxt
 
 st.set_page_config(page_title="Real BTC Wavelet Test", layout="wide")
 st.title("🌊 Causal Wavelet + Auto-Labeling on Real BTC")
-st.markdown("Live data from Kraken • Fixed window • High transaction costs")
+st.markdown("**Live Kraken BTC/USD 1h data** • Fixed window • High costs")
 
 # ==============================================================================
-# FETCH REAL BTC DATA (pagination)
+# FETCH REAL BTC DATA
 # ==============================================================================
 @st.cache_data(ttl=1800)
 def fetch_real_btc_data(target_bars=3500):
@@ -25,7 +25,7 @@ def fetch_real_btc_data(target_bars=3500):
                 if not candles:
                     break
                 all_candles.extend(candles)
-                since = candles[-1][0] + 3600000  # 1 hour in ms
+                since = candles[-1][0] + 3600000
                 if len(candles) < batch_size:
                     break
 
@@ -83,50 +83,26 @@ def auto_labeling(data_tuple, timestamp_tuple, w):
         timestamps = timestamps.iloc[:min_len].reset_index(drop=True)
     n = len(data_list)
     labels = np.zeros(n)
-    FP = data_list[0]
-    x_H = data_list[0]
-    HT = timestamps[0]
-    x_L = data_list[0]
-    LT = timestamps[0]
-    Cid = 0
-    FP_N = 0
-
+    FP = data_list[0]; x_H = data_list[0]; HT = timestamps[0]
+    x_L = data_list[0]; LT = timestamps[0]; Cid = 0; FP_N = 0
     for i in range(n):
         if data_list[i] > FP + FP * w:
-            x_H = data_list[i]
-            HT = timestamps[i]
-            FP_N = i
-            Cid = 1
-            break
+            x_H = data_list[i]; HT = timestamps[i]; FP_N = i; Cid = 1; break
         if data_list[i] < FP - FP * w:
-            x_L = data_list[i]
-            LT = timestamps[i]
-            FP_N = i
-            Cid = -1
-            break
-
+            x_L = data_list[i]; LT = timestamps[i]; FP_N = i; Cid = -1; break
     for i in range(max(FP_N, 1), n):
         if Cid > 0:
-            if data_list[i] > x_H:
-                x_H = data_list[i]
-                HT = timestamps[i]
+            if data_list[i] > x_H: x_H = data_list[i]; HT = timestamps[i]
             if data_list[i] < x_H - x_H * w and LT < HT:
                 mask = ((timestamps > LT) & (timestamps <= HT)).values
                 labels[mask] = 1
-                x_L = data_list[i]
-                LT = timestamps[i]
-                Cid = -1
+                x_L = data_list[i]; LT = timestamps[i]; Cid = -1
         elif Cid < 0:
-            if data_list[i] < x_L:
-                x_L = data_list[i]
-                LT = timestamps[i]
+            if data_list[i] < x_L: x_L = data_list[i]; LT = timestamps[i]
             if data_list[i] > x_L + x_L * w and HT <= LT:
                 mask = ((timestamps > HT) & (timestamps <= LT)).values
                 labels[mask] = -1
-                x_H = data_list[i]
-                HT = timestamps[i]
-                Cid = 1
-
+                x_H = data_list[i]; HT = timestamps[i]; Cid = 1
     labels = np.where(labels == 0, Cid, labels)
     return labels
 
@@ -164,7 +140,7 @@ def prices_from_resampled_returns(base_prices, rng):
 # SIDEBAR
 # ==============================================================================
 st.sidebar.header("Settings")
-target_bars = st.sidebar.slider("Target number of 1h bars", 1500, 5000, 3500, step=100)
+target_bars = st.sidebar.slider("Target bars to fetch", 1500, 5000, 3500, step=100)
 tc_bps = st.sidebar.slider("Transaction Cost (bps)", 15, 40, 22, step=1)
 fixed_window = st.sidebar.number_input("Fixed Window Size", value=420, min_value=250, max_value=600, step=20)
 use_oos = st.sidebar.checkbox("Use Out-of-Sample", value=True)
@@ -175,6 +151,8 @@ if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
     prices = fetch_real_btc_data(target_bars)
     if prices is None or len(prices) < 1000:
         st.stop()
+
+    st.info("✅ Data fetched. Starting full test...")
 
     seed = 12345
     rng = np.random.default_rng(seed)
@@ -211,9 +189,9 @@ if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
         st.metric("p-value", f"{p_value:.1%}")
 
     if train_sharpe > q95 * 0.9:
-        st.success("✅ Good result on real BTC data!")
+        st.success("✅ Good result on real BTC!")
     else:
-        st.warning("⚠️ Still overfitting (very common with this method on BTC)")
+        st.warning("⚠️ Still overfitting (common with this method)")
 
     # Equity Curve
     st.subheader("📈 Equity Curve - Out-of-Sample Period")
@@ -225,6 +203,6 @@ if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
     st.line_chart(pd.DataFrame({"Equity": equity}), use_container_width=True)
 
 else:
-    st.info("👆 Click the big button to fetch real BTC data and run the full test")
+    st.info("Click the button above to fetch real BTC data and run the full test")
 
-st.caption("Real BTC 1h data from Kraken via CCXT • Fixed window strategy")
+st.caption("Real BTC 1h data from Kraken • Fixed window strategy")
