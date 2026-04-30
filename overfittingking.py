@@ -84,6 +84,43 @@ def init_db() -> None:
                 """
             )
 
+            feature_cols = [row[1] for row in cur.execute("PRAGMA table_info(feature_snapshots)").fetchall()]
+            if feature_cols and "snapshot_ts" not in feature_cols:
+                cur.execute("ALTER TABLE feature_snapshots RENAME TO feature_snapshots_old")
+                cur.execute(
+                    """
+                    CREATE TABLE feature_snapshots (
+                        exchange TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        ts INTEGER NOT NULL,
+                        snapshot_ts INTEGER NOT NULL,
+                        orderbook_imbalance REAL,
+                        vwap_gap REAL,
+                        ema_slope REAL,
+                        volume_z REAL,
+                        PRIMARY KEY (exchange, symbol, timeframe, ts, snapshot_ts)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO feature_snapshots
+                    (exchange, symbol, timeframe, ts, snapshot_ts, orderbook_imbalance, vwap_gap, ema_slope, volume_z)
+                    SELECT exchange,
+                           symbol,
+                           timeframe,
+                           ts,
+                           ts,
+                           orderbook_imbalance,
+                           vwap_gap,
+                           ema_slope,
+                           volume_z
+                    FROM feature_snapshots_old
+                    """
+                )
+                cur.execute("DROP TABLE feature_snapshots_old")
+
     execute_with_retry(_init)
 
 
