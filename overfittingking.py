@@ -74,11 +74,12 @@ def init_db() -> None:
                     symbol TEXT NOT NULL,
                     timeframe TEXT NOT NULL,
                     ts INTEGER NOT NULL,
+                    snapshot_ts INTEGER NOT NULL,
                     orderbook_imbalance REAL,
                     vwap_gap REAL,
                     ema_slope REAL,
                     volume_z REAL,
-                    PRIMARY KEY (exchange, symbol, timeframe, ts)
+                    PRIMARY KEY (exchange, symbol, timeframe, ts, snapshot_ts)
                 )
                 """
             )
@@ -123,6 +124,7 @@ def store_feature_snapshot(
     symbol: str,
     timeframe: str,
     ts: int,
+    snapshot_ts: int,
     orderbook_imbalance: float,
     vwap_gap: float,
     ema_slope: float,
@@ -133,14 +135,15 @@ def store_feature_snapshot(
             conn.execute(
                 """
                 INSERT OR REPLACE INTO feature_snapshots
-                (exchange, symbol, timeframe, ts, orderbook_imbalance, vwap_gap, ema_slope, volume_z)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (exchange, symbol, timeframe, ts, snapshot_ts, orderbook_imbalance, vwap_gap, ema_slope, volume_z)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     exchange,
                     symbol,
                     timeframe,
                     ts,
+                    snapshot_ts,
                     orderbook_imbalance,
                     vwap_gap,
                     ema_slope,
@@ -149,6 +152,25 @@ def store_feature_snapshot(
             )
 
     execute_with_retry(_store)
+
+
+def load_recent_feature_snapshots(limit: int = 200) -> pd.DataFrame:
+    def _load() -> pd.DataFrame:
+        with open_db() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT exchange, symbol, timeframe, ts, snapshot_ts,
+                       orderbook_imbalance, vwap_gap, ema_slope, volume_z
+                FROM feature_snapshots
+                WHERE symbol = ?
+                ORDER BY snapshot_ts DESC
+                LIMIT ?
+                """,
+                conn,
+                params=(PRIMARY_SYMBOL, limit),
+            )
+
+    return execute_with_retry(_load)
 
 
 def _safe_sharpe(rets: np.ndarray, periods_per_year: int = PERIODS_PER_YEAR) -> float:
@@ -940,6 +962,7 @@ use_vwap_filter = st.sidebar.checkbox("Use VWAP confirmation", value=True)
 use_ema_filter = st.sidebar.checkbox("Use EMA slope confirmation", value=True)
 use_volume_filter = st.sidebar.checkbox("Use volume z-score filter", value=False)
 min_volume_z = st.sidebar.slider("Min volume z-score", -1.0, 2.0, 0.0, step=0.1)
+deployment_gate = st.sidebar.slider("Deployment gate: checks required", 6, 10, 9, step=1)
 
 
 if st.button("Fetch Real BTC Data & Run Test", type="primary"):
@@ -963,6 +986,7 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         symbol=PRIMARY_SYMBOL,
         timeframe=TIMEFRAME,
         ts=int(latest_row["ts"]),
+        snapshot_ts=int(time.time() * 1000),
         orderbook_imbalance=live_orderbook_imbalance,
         vwap_gap=float(latest_row["vwap_gap"]),
         ema_slope=float(latest_row["ema_slope"]),
@@ -989,7 +1013,12 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         st.metric("EMA slope", f"{latest_row['ema_slope']:.3%}")
     with live_cols[3]:
         st.metric("Volume z-score", f"{latest_row['volume_z']:.2f}")
-    st.caption("The live orderbook snapshot is logged to SQLite for future study. It is not backfilled historically, so it is not used in the historical holdout test yet.")
+    recent_snapshots = load_recent_feature_snapshots(limit=200)
+    st.caption(
+        f"The live orderbook snapshot is being accumulated in SQLite for future study. "
+        f"Stored snapshots for {PRIMARY_SYMBOL}: {len(recent_snapshots)}. "
+        f"It is not backfilled historically yet, so it is not part of the historical holdout test."
+    )
 
     candidate_windows = sorted(
         {
@@ -1296,10 +1325,10 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     st.subheader("Strategy Comparison")
     compare_df = pd.DataFrame(
         [
-            {"strategy": "Raw wavelet", "sharpe": wavelet_raw_sharpe},
-            {"strategy": "Feature-filtered wavelet", "sharpe": wavelet_filtered_sharpe},
-            {"strategy": "Raw amplitude", "sharpe": amplitude_raw_sharpe},
-            {"strategy": "Feature-filtered amplitude" if not use_amplitude_ensemble else "Feature-filtered amplitude ensemble", "sharpe": amplitude_filtered_sharpe},
+            {"strategy": "Primary candidate: filtered amplitude" if not use_amplitude_ensemble else "Primary candidate: filtered amplitude ensemble", "sharpe": amplitude_filtered_sharpe},
+            {"strategy": "Primary candidate: raw amplitude", "sharpe": amplitude_raw_sharpe},
+            {"strategy": "Benchmark: filtered wavelet", "sharpe": wavelet_filtered_sharpe},
+            {"strategy": "Benchmark: raw wavelet", "sharpe": wavelet_raw_sharpe},
             {"strategy": "Buy and hold", "sharpe": buy_hold_sharpe},
             {"strategy": "24/72 MA crossover", "sharpe": ma_sharpe},
         ]
@@ -1308,6 +1337,8 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
 
     filter_state_df = pd.DataFrame(
         [
+            {"filter": "Primary candidate", "enabled": "Amplitude"},
+            {"filter": "Benchmark", "enabled": "Wavelet"},
             {"filter": "VWAP confirmation", "enabled": use_vwap_filter},
             {"filter": "EMA slope confirmation", "enabled": use_ema_filter},
             {"filter": "Volume z-score", "enabled": use_volume_filter},
@@ -1325,20 +1356,11 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         st.subheader("Cross-Asset Check")
         st.dataframe(pd.DataFrame(cross_asset_rows), width="stretch", hide_index=True)
 
-    st.subheader("Filtered Equity Curves")
-    chart_label = "Holdout Equity" if use_oos else "In-sample Equity"
-    st.line_chart(
-        pd.DataFrame(
-            {
-                f"Wavelet {chart_label}": wavelet_filtered_equity,
-                f"Amplitude {chart_label}": amplitude_filtered_equity,
-            }
-        ),
-        width="stretch",
-    )
-
-    st.caption(
-        "Candles and live feature snapshots are stored in SQLite. Historical backtests currently use candle-derived features only; live orderbook imbalance is logged for future out-of-sample research. Wavelet and amplitude signals are both tested under the same holdout, bootstrap, baseline, and cross-asset framework."
-    )
-else:
-    st.info("Click the button to fetch real BTC data and run the feature-filtered validation pass.")
+    if not recent_snapshots.empty:
+        st.subheader("Recent Orderbook Snapshot History")
+        display_snapshots = recent_snapshots.copy()
+        display_snapshots["snapshot_dt"] = pd.to_datetime(display_snapshots["snapshot_ts"], unit="ms", utc=True)
+        st.dataframe(
+            display_snapshots[
+                ["snapshot_dt", "exchange", "symbol", "orderbook_imbalance", "vwap_gap", "ema_slope", "volume_z"]
+            ],
