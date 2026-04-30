@@ -1,111 +1,180 @@
-import streamlit as st
+import time
+from typing import Optional, Tuple
+
+import ccxt
 import numpy as np
 import pandas as pd
 import pywt
-import ccxt
+import streamlit as st
+
+
+TIMEFRAME = "1h"
+SYMBOL = "BTC/USD"
+MS_PER_HOUR = 60 * 60 * 1000
+PERIODS_PER_YEAR = 252 * 24
+
 
 st.set_page_config(page_title="Real BTC Wavelet Test", layout="wide")
-st.title("🌊 Causal Wavelet + Auto-Labeling on Real BTC")
-st.markdown("Live Kraken BTC/USD 1h data")
-
-# ==============================================================================
-@st.cache_data(ttl=1800)
-def fetch_real_btc_data(target_bars=4000):
-    try:
-        exchange = ccxt.kraken({'enableRateLimit': True})
-        all_candles = []
-        since = None
-        batch_size = 1000
-
-        with st.spinner("Fetching real BTC 1h data from Kraken..."):
-            while len(all_candles) < target_bars:
-                candles = exchange.fetch_ohlcv('BTC/USD', '1h', limit=batch_size, since=since)
-                if not candles or len(candles) == 0:
-                    break
-                all_candles.extend(candles)
-                since = candles[-1][0] + 3600000
-                if len(candles) < batch_size:
-                    break
-
-        df = pd.DataFrame(all_candles, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-        df = df.drop_duplicates(subset='ts').sort_values('ts')
-        prices = df['close'].values.astype(float)
-
-        days = len(prices) // 24
-        st.success(f"✅ Fetched **{len(prices)}** real BTC 1h bars (~{days} days)")
-        return prices
-    except Exception as e:
-        st.error(f"Fetch failed: {e}")
-        return None
+st.title("Causal Wavelet + Honest BTC Validation")
+st.markdown("Live Kraken BTC/USD 1h data with walk-forward training and true holdout testing.")
 
 
-# ==============================================================================
-# CORE FUNCTIONS
-# ==============================================================================
-def sharpe_ratio(rets, periods_per_year=252*24):
+def _safe_sharpe(rets: np.ndarray, periods_per_year: int = PERIODS_PER_YEAR) -> float:
+    if rets.size < 2:
+        return np.nan
     sd = np.std(rets, ddof=1)
     if sd == 0 or np.isnan(sd):
         return np.nan
-    return np.sqrt(periods_per_year) * np.mean(rets) / sd
+    return float(np.sqrt(periods_per_year) * np.mean(rets) / sd)
 
 
-def rogers_satchell_volatility_approx(prices):
-    if len(prices) < 2:
+def _volatility_band(prices: np.ndarray, multiplier: float = 1.8) -> float:
+    if prices.size < 2:
         return 0.02
-    log_rets = np.log(prices[1:] / prices[:-1])
-    return np.std(log_rets, ddof=1)
+    log_rets = np.diff(np.log(prices))
+    sigma = np.std(log_rets, ddof=1)
+    if np.isnan(sigma) or sigma <= 0:
+        return 0.02
+    return float(max(sigma * multiplier, 1e-4))
 
 
-@st.cache_data
-def causal_wavelet_denoise(prices_tuple, window_size):
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_real_btc_data(target_bars: int = 4000) -> Optional[pd.DataFrame]:
+    try:
+        exchange = ccxt.kraken({"enableRateLimit": True})
+        exchange.load_markets()
+
+        timeframe_ms = exchange.parse_timeframe(TIMEFRAME) * 1000
+        request_limit = min(720, target_bars)
+        warmup_bars = 256
+        total_needed = target_bars + warmup_bars
+        now_ms = exchange.milliseconds()
+        since = now_ms - total_needed * timeframe_ms
+
+        all_candles: list[list[float]] = []
+        max_loops = max(3, int(np.ceil(total_needed / request_limit)) + 3)
+
+        for _ in range(max_loops):
+            candles = exchange.fetch_ohlcv(
+                SYMBOL,
+                timeframe=TIMEFRAME,
+                since=since,
+                limit=request_limit,
+            )
+            if not candles:
+                break
+
+            all_candles.extend(candles)
+            last_ts = candles[-1][0]
+            next_since = last_ts + timeframe_ms
+            if next_since <= since:
+                break
+            since = next_since
+
+            if len(candles) < request_limit or last_ts >= now_ms - timeframe_ms:
+                break
+
+            time.sleep(exchange.rateLimit / 1000.0)
+
+        if not all_candles:
+            return None
+
+        df = pd.DataFrame(
+            all_candles,
+            columns=["ts", "open", "high", "low", "close", "volume"],
+        )
+        df = df.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
+        df = df.tail(total_needed).copy()
+        df["datetime"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+
+        return df
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def causal_wavelet_denoise(prices_tuple: tuple[float, ...], window_size: int) -> np.ndarray:
     prices = np.asarray(prices_tuple, dtype=float)
+    if prices.size == 0:
+        return prices
+
     denoised = prices.copy()
-    for i in range(window_size, len(prices)):
-        window_data = prices[i - window_size + 1: i + 1]
-        coeffs = pywt.wavedec(window_data, 'db4', level=4)
-        sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-        uthresh = sigma * np.sqrt(2 * np.log(len(window_data)))
-        coeffs_thresh = [coeffs[0]] + [pywt.threshold(c, uthresh, mode='soft') for c in coeffs[1:]]
-        window_denoised = pywt.waverec(coeffs_thresh, 'db4')
-        window_denoised = np.asarray(window_denoised).flatten()[:len(window_data)]
-        denoised[i] = window_denoised[-1]
+    wavelet = pywt.Wavelet("db4")
+
+    for i in range(window_size - 1, len(prices)):
+        window_data = prices[i - window_size + 1 : i + 1]
+        max_level = pywt.dwt_max_level(len(window_data), wavelet.dec_len)
+        level = min(4, max_level)
+        if level < 1:
+            denoised[i] = window_data[-1]
+            continue
+
+        coeffs = pywt.wavedec(window_data, wavelet, level=level, mode="symmetric")
+        sigma = np.median(np.abs(coeffs[-1])) / 0.6745 if coeffs[-1].size else 0.0
+        uthresh = sigma * np.sqrt(2.0 * np.log(len(window_data))) if sigma > 0 else 0.0
+        coeffs_thresh = [coeffs[0]] + [
+            pywt.threshold(c, uthresh, mode="soft") for c in coeffs[1:]
+        ]
+        rebuilt = pywt.waverec(coeffs_thresh, wavelet, mode="symmetric")
+        denoised[i] = np.asarray(rebuilt).flatten()[: len(window_data)][-1]
+
     return denoised
 
 
-def auto_labeling(data_tuple, timestamp_tuple, w):
-    data_list = np.asarray(data_tuple).flatten()
-    timestamps = pd.Series(timestamp_tuple)
-    if len(data_list) != len(timestamps):
-        min_len = min(len(data_list), len(timestamps))
-        data_list = data_list[:min_len]
-        timestamps = timestamps.iloc[:min_len].reset_index(drop=True)
-    n = len(data_list)
-    labels = np.zeros(n)
-    FP = data_list[0]; x_H = data_list[0]; HT = timestamps[0]
-    x_L = data_list[0]; LT = timestamps[0]; Cid = 0; FP_N = 0
+def auto_labeling(data: np.ndarray, timestamps: np.ndarray, w: float) -> np.ndarray:
+    prices = np.asarray(data, dtype=float).flatten()
+    ts = np.asarray(timestamps)
+    n = min(prices.size, ts.size)
+    prices = prices[:n]
+    ts = ts[:n]
+
+    labels = np.zeros(n, dtype=float)
+    fp = prices[0]
+    x_h = fp
+    x_l = fp
+    ht = ts[0]
+    lt = ts[0]
+    cid = 0
+    fp_n = 0
+
     for i in range(n):
-        if data_list[i] > FP + FP * w:
-            x_H = data_list[i]; HT = timestamps[i]; FP_N = i; Cid = 1; break
-        if data_list[i] < FP - FP * w:
-            x_L = data_list[i]; LT = timestamps[i]; FP_N = i; Cid = -1; break
-    for i in range(max(FP_N, 1), n):
-        if Cid > 0:
-            if data_list[i] > x_H: x_H = data_list[i]; HT = timestamps[i]
-            if data_list[i] < x_H - x_H * w and LT < HT:
-                mask = ((timestamps > LT) & (timestamps <= HT)).values
-                labels[mask] = 1
-                x_L = data_list[i]; LT = timestamps[i]; Cid = -1
-        elif Cid < 0:
-            if data_list[i] < x_L: x_L = data_list[i]; LT = timestamps[i]
-            if data_list[i] > x_L + x_L * w and HT <= LT:
-                mask = ((timestamps > HT) & (timestamps <= LT)).values
-                labels[mask] = -1
-                x_H = data_list[i]; HT = timestamps[i]; Cid = 1
-    labels = np.where(labels == 0, Cid, labels)
-    return labels
+        if prices[i] > fp * (1.0 + w):
+            x_h = prices[i]
+            ht = ts[i]
+            fp_n = i
+            cid = 1
+            break
+        if prices[i] < fp * (1.0 - w):
+            x_l = prices[i]
+            lt = ts[i]
+            fp_n = i
+            cid = -1
+            break
+
+    for i in range(max(fp_n, 1), n):
+        if cid > 0:
+            if prices[i] > x_h:
+                x_h = prices[i]
+                ht = ts[i]
+            if prices[i] < x_h * (1.0 - w) and lt < ht:
+                labels[(ts > lt) & (ts <= ht)] = 1.0
+                x_l = prices[i]
+                lt = ts[i]
+                cid = -1
+        elif cid < 0:
+            if prices[i] < x_l:
+                x_l = prices[i]
+                lt = ts[i]
+            if prices[i] > x_l * (1.0 + w) and ht <= lt:
+                labels[(ts > ht) & (ts <= lt)] = -1.0
+                x_h = prices[i]
+                ht = ts[i]
+                cid = 1
+
+    return np.where(labels == 0, cid, labels)
 
 
-def strategy_returns_from_labels(prices, labels, tc_bps=22):
+def strategy_returns_from_labels(prices: np.ndarray, labels: np.ndarray, tc_bps: int = 22) -> np.ndarray:
     asset_rets = prices[1:] / prices[:-1] - 1.0
     pos = labels[:-1]
     strat_rets = pos * asset_rets
@@ -114,18 +183,60 @@ def strategy_returns_from_labels(prices, labels, tc_bps=22):
     return strat_rets
 
 
-def evaluate_single_window(prices, window_size, tc_bps, periods_per_year=252*24):
-    if window_size >= len(prices):
+def evaluate_single_window(prices: np.ndarray, window_size: int, tc_bps: int) -> float:
+    min_required = max(window_size + 10, 300)
+    if prices.size < min_required:
         return np.nan
+
     denoised = causal_wavelet_denoise(tuple(prices), window_size)
-    w = rogers_satchell_volatility_approx(prices) * 1.8
-    idx = np.arange(len(prices))
-    labels = auto_labeling(tuple(denoised), tuple(idx), w)
+    w = _volatility_band(prices)
+    labels = auto_labeling(denoised, np.arange(prices.size), w)
     strat_rets = strategy_returns_from_labels(prices, labels, tc_bps)
-    return sharpe_ratio(strat_rets, periods_per_year)
+    return _safe_sharpe(strat_rets)
 
 
-def prices_from_resampled_returns(base_prices, rng):
+def walk_forward_score(
+    prices: np.ndarray,
+    window_size: int,
+    tc_bps: int,
+    n_splits: int = 4,
+    min_train_bars: int = 800,
+    test_bars: int = 240,
+) -> float:
+    fold_scores: list[float] = []
+    n = prices.size
+    first_test_end = n_splits * test_bars
+
+    if n < min_train_bars + first_test_end:
+        return np.nan
+
+    train_end = n - first_test_end
+    for _ in range(n_splits):
+        test_end = train_end + test_bars
+        train_slice = prices[:train_end]
+        test_slice = prices[train_end:test_end]
+
+        if test_slice.size < test_bars or train_slice.size < max(min_train_bars, window_size + 10):
+            return np.nan
+
+        combined = np.concatenate([train_slice[-window_size:], test_slice])
+        denoised = causal_wavelet_denoise(tuple(combined), window_size)
+        denoised_test = denoised[window_size:]
+        w = _volatility_band(train_slice)
+        labels = auto_labeling(denoised_test, np.arange(denoised_test.size), w)
+        rets = strategy_returns_from_labels(test_slice, labels, tc_bps)
+        score = _safe_sharpe(rets)
+        if np.isnan(score):
+            return np.nan
+        fold_scores.append(score)
+        train_end = test_end
+
+    if not fold_scores:
+        return np.nan
+    return float(np.mean(fold_scores))
+
+
+def prices_from_resampled_returns(base_prices: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     orig_rets = base_prices[1:] / base_prices[:-1] - 1.0
     boot_rets = rng.choice(orig_rets, size=orig_rets.size, replace=True)
     prices = np.empty(base_prices.size, dtype=float)
@@ -134,73 +245,152 @@ def prices_from_resampled_returns(base_prices, rng):
     return prices
 
 
-# ==============================================================================
-# SIDEBAR
-# ==============================================================================
+def choose_best_window(
+    prices: np.ndarray, candidate_windows: list[int], tc_bps: int
+) -> Tuple[Optional[int], pd.DataFrame]:
+    rows = []
+    for window in candidate_windows:
+        score = walk_forward_score(prices, window, tc_bps)
+        rows.append({"window": window, "walk_forward_sharpe": score})
+
+    score_df = pd.DataFrame(rows).sort_values(
+        by=["walk_forward_sharpe", "window"],
+        ascending=[False, True],
+        na_position="last",
+    )
+    if score_df.empty or score_df["walk_forward_sharpe"].isna().all():
+        return None, score_df
+    return int(score_df.iloc[0]["window"]), score_df
+
+
+def final_oos_returns(train_prices: np.ndarray, test_prices: np.ndarray, window_size: int, tc_bps: int) -> np.ndarray:
+    combined = np.concatenate([train_prices[-window_size:], test_prices])
+    denoised = causal_wavelet_denoise(tuple(combined), window_size)
+    denoised_test = denoised[window_size:]
+    w = _volatility_band(train_prices)
+    labels = auto_labeling(denoised_test, np.arange(denoised_test.size), w)
+    return strategy_returns_from_labels(test_prices, labels, tc_bps)
+
+
 st.sidebar.header("Settings")
 target_bars = st.sidebar.slider("Target bars", 1500, 5000, 3500, step=100)
-tc_bps = st.sidebar.slider("Transaction Cost (bps)", 15, 40, 22, step=1)
-fixed_window = st.sidebar.number_input("Fixed Window Size", value=420, min_value=250, max_value=600, step=20)
-use_oos = st.sidebar.checkbox("Use Out-of-Sample", value=True)
-oos_pct = st.sidebar.slider("OOS %", 30, 45, 35, step=5)
+tc_bps = st.sidebar.slider("Transaction cost (bps)", 15, 40, 22, step=1)
+fixed_window = st.sidebar.number_input("Center window size", value=420, min_value=200, max_value=900, step=20)
+window_span = st.sidebar.slider("Window search span", 40, 240, 120, step=20)
+window_step = st.sidebar.select_slider("Window search step", options=[10, 20, 30, 40, 60], value=20)
+use_oos = st.sidebar.checkbox("Use final holdout", value=True)
+oos_pct = st.sidebar.slider("Holdout %", 20, 45, 35, step=5)
+n_boot = st.sidebar.slider("Bootstrap runs", 100, 800, 300, step=50)
 
-# ==============================================================================
-if st.button("🚀 Fetch Real BTC Data & Run Full Test", type="primary"):
-    
-    prices = fetch_real_btc_data(target_bars)
-    if prices is None or len(prices) < 1000:
+
+if st.button("Fetch Real BTC Data & Run Test", type="primary"):
+    with st.spinner("Fetching Kraken BTC/USD candles..."):
+        df = fetch_real_btc_data(target_bars)
+
+    if df is None or len(df) < 1200:
+        st.error("Fetch failed or returned too little data. Try again in a moment.")
         st.stop()
 
-    st.info("✅ Data fetched successfully. Now running the full test...")
+    prices = df["close"].to_numpy(dtype=float)
+    shown_df = df.tail(target_bars).copy()
+    start_dt = shown_df["datetime"].iloc[0]
+    end_dt = shown_df["datetime"].iloc[-1]
+    st.success(
+        f"Fetched {len(shown_df)} BTC/USD 1h bars from {start_dt:%Y-%m-%d %H:%M UTC} to {end_dt:%Y-%m-%d %H:%M UTC}."
+    )
 
-    seed = 12345
-    rng = np.random.default_rng(seed)
+    candidate_windows = sorted(
+        {
+            w
+            for w in range(
+                max(160, fixed_window - window_span),
+                min(960, fixed_window + window_span) + 1,
+                window_step,
+            )
+        }
+    )
 
-    with st.spinner("Running full test on real BTC data..."):
+    if use_oos:
         split_idx = int(len(prices) * (1 - oos_pct / 100))
         train_prices = prices[:split_idx]
         test_prices = prices[split_idx:]
+    else:
+        train_prices = prices
+        test_prices = prices
+        st.warning("Holdout is disabled. Any score below is in-sample and should not be trusted as evidence.")
 
-        best_win = fixed_window
-        train_sharpe = evaluate_single_window(train_prices, best_win, tc_bps)
-        oos_sharpe = evaluate_single_window(test_prices, best_win, tc_bps)
+    with st.spinner("Selecting the window using walk-forward validation on the training set..."):
+        best_win, score_df = choose_best_window(train_prices, candidate_windows, tc_bps)
 
-    # Bootstrap
-    progress_bar = st.progress(0, text="Running Bootstrap...")
-    n_boot = 600
-    best_boot = np.empty(n_boot)
+    if best_win is None:
+        st.error("Could not score the candidate windows. Increase target bars or reduce the search range.")
+        st.stop()
+
+    train_cv_sharpe = float(score_df.iloc[0]["walk_forward_sharpe"])
+
+    if use_oos:
+        oos_rets = final_oos_returns(train_prices, test_prices, best_win, tc_bps)
+        oos_sharpe = _safe_sharpe(oos_rets)
+        equity = np.cumprod(1.0 + np.concatenate(([0.0], oos_rets)))
+    else:
+        oos_rets = strategy_returns_from_labels(
+            train_prices,
+            auto_labeling(
+                causal_wavelet_denoise(tuple(train_prices), best_win),
+                np.arange(train_prices.size),
+                _volatility_band(train_prices),
+            ),
+            tc_bps,
+        )
+        oos_sharpe = _safe_sharpe(oos_rets)
+        equity = np.cumprod(1.0 + np.concatenate(([0.0], oos_rets)))
+
+    rng = np.random.default_rng(12345)
+    progress_bar = st.progress(0, text="Running bootstrap under the null...")
+    best_boot = np.empty(n_boot, dtype=float)
     for i in range(n_boot):
-        boot_p = prices_from_resampled_returns(train_prices, rng)
-        best_boot[i] = evaluate_single_window(boot_p, best_win, tc_bps)
-        if (i + 1) % 100 == 0:
-            progress_bar.progress((i + 1) / n_boot)
+        boot_prices = prices_from_resampled_returns(train_prices, rng)
+        boot_best_win, boot_scores = choose_best_window(boot_prices, candidate_windows, tc_bps)
+        best_boot[i] = (
+            float(boot_scores.iloc[0]["walk_forward_sharpe"])
+            if boot_best_win is not None
+            else np.nan
+        )
+        progress_bar.progress((i + 1) / n_boot)
     progress_bar.empty()
 
-    p_value = np.mean(best_boot >= train_sharpe)
-    q95 = np.quantile(best_boot, 0.95)
+    valid_boot = best_boot[~np.isnan(best_boot)]
+    p_value = float(np.mean(valid_boot >= train_cv_sharpe)) if valid_boot.size else np.nan
+    q95 = float(np.quantile(valid_boot, 0.95)) if valid_boot.size else np.nan
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Fixed Window", f"{best_win} bars")
-        st.metric("Train Sharpe", f"{train_sharpe:.4f}")
+        st.metric("Selected window", f"{best_win} bars")
+        st.metric("Train CV Sharpe", f"{train_cv_sharpe:.4f}")
     with col2:
-        st.metric("OOS Sharpe", f"{oos_sharpe:.4f}")
-        st.metric("p-value", f"{p_value:.1%}")
+        st.metric("Holdout Sharpe" if use_oos else "In-sample Sharpe", f"{oos_sharpe:.4f}")
+        st.metric("Bootstrap p-value", "n/a" if np.isnan(p_value) else f"{p_value:.1%}")
+    with col3:
+        st.metric("Train bars", f"{len(train_prices)}")
+        st.metric("Holdout bars" if use_oos else "Scored bars", f"{len(test_prices)}")
 
-    if train_sharpe > q95 * 0.9:
-        st.success("✅ Good result on real BTC!")
-    else:
-        st.warning("⚠️ Still overfitting (common with this method)")
+    st.subheader("Window Search Results")
+    st.dataframe(score_df, use_container_width=True, hide_index=True)
 
-    st.subheader("📈 Equity Curve - Out-of-Sample Period")
-    denoised = causal_wavelet_denoise(tuple(test_prices), best_win)
-    w = rogers_satchell_volatility_approx(test_prices) * 1.8
-    labels = auto_labeling(tuple(denoised), tuple(np.arange(len(test_prices))), w)
-    strat_rets = strategy_returns_from_labels(test_prices, labels, tc_bps)
-    equity = np.cumprod(1 + np.concatenate(([0.], strat_rets)))
-    st.line_chart(pd.DataFrame({"Equity": equity}), use_container_width=True)
+    if not np.isnan(q95):
+        if train_cv_sharpe > q95 and use_oos and oos_sharpe > 0:
+            st.success("The model cleared the bootstrap threshold on training CV and stayed positive on the holdout.")
+        elif use_oos and oos_sharpe <= 0:
+            st.warning("The selected window did not hold up on the final holdout. Treat this as likely overfitting.")
+        else:
+            st.warning("The training CV edge is not clearly above the bootstrap null. This still looks fragile.")
 
+    st.subheader("Equity Curve")
+    chart_label = "Holdout Equity" if use_oos else "In-sample Equity"
+    st.line_chart(pd.DataFrame({chart_label: equity}), use_container_width=True)
+
+    st.caption(
+        "Fetch source: Kraken via ccxt. Window selection uses only the training set. Holdout evaluation is performed once after selection."
+    )
 else:
-    st.info("👆 Click the button to fetch real BTC data and run the full test")
-
-st.caption("Real BTC 1h data from Kraken • Fixed window strategy")
+    st.info("Click the button to fetch real BTC data and run a stricter validation pass.")
