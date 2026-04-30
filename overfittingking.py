@@ -26,48 +26,69 @@ st.title("Causal Wavelet + Feature-Filtered Validation")
 st.markdown("Live BTC/USD 1h data via ccxt with baselines, block bootstrap, SQLite logging, and feature filters.")
 
 
+def open_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
+
+def execute_with_retry(fn, attempts: int = 5, delay: float = 0.25):
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ohlcv (
-            exchange TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            open REAL NOT NULL,
-            high REAL NOT NULL,
-            low REAL NOT NULL,
-            close REAL NOT NULL,
-            volume REAL NOT NULL,
-            PRIMARY KEY (exchange, symbol, timeframe, ts)
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feature_snapshots (
-            exchange TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            timeframe TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            orderbook_imbalance REAL,
-            vwap_gap REAL,
-            ema_slope REAL,
-            volume_z REAL,
-            PRIMARY KEY (exchange, symbol, timeframe, ts)
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+    def _init() -> None:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ohlcv (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    PRIMARY KEY (exchange, symbol, timeframe, ts)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feature_snapshots (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    orderbook_imbalance REAL,
+                    vwap_gap REAL,
+                    ema_slope REAL,
+                    volume_z REAL,
+                    PRIMARY KEY (exchange, symbol, timeframe, ts)
+                )
+                """
+            )
+
+    execute_with_retry(_init)
 
 
 def store_ohlcv(df: pd.DataFrame, exchange: str, symbol: str, timeframe: str) -> None:
     if df.empty:
         return
-    conn = sqlite3.connect(DB_PATH)
     rows = [
         (
             exchange,
@@ -82,16 +103,19 @@ def store_ohlcv(df: pd.DataFrame, exchange: str, symbol: str, timeframe: str) ->
         )
         for row in df.itertuples(index=False)
     ]
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO ohlcv
-        (exchange, symbol, timeframe, ts, open, high, low, close, volume)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    conn.commit()
-    conn.close()
+
+    def _store() -> None:
+        with open_db() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO ohlcv
+                (exchange, symbol, timeframe, ts, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    execute_with_retry(_store)
 
 
 def store_feature_snapshot(
@@ -104,26 +128,27 @@ def store_feature_snapshot(
     ema_slope: float,
     volume_z: float,
 ) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO feature_snapshots
-        (exchange, symbol, timeframe, ts, orderbook_imbalance, vwap_gap, ema_slope, volume_z)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            exchange,
-            symbol,
-            timeframe,
-            ts,
-            orderbook_imbalance,
-            vwap_gap,
-            ema_slope,
-            volume_z,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    def _store() -> None:
+        with open_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO feature_snapshots
+                (exchange, symbol, timeframe, ts, orderbook_imbalance, vwap_gap, ema_slope, volume_z)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    exchange,
+                    symbol,
+                    timeframe,
+                    ts,
+                    orderbook_imbalance,
+                    vwap_gap,
+                    ema_slope,
+                    volume_z,
+                ),
+            )
+
+    execute_with_retry(_store)
 
 
 def _safe_sharpe(rets: np.ndarray, periods_per_year: int = PERIODS_PER_YEAR) -> float:
@@ -491,6 +516,24 @@ def amplitude_ensemble_labels(
     stacked = np.vstack(label_stack)
     mean_signal = stacked.mean(axis=0)
     return np.where(mean_signal > 0.05, 1.0, np.where(mean_signal < -0.05, -1.0, 0.0))
+
+
+def estimate_workload_units(
+    target_bars: int,
+    n_boot: int,
+    run_cross_asset: bool,
+    use_amplitude_ensemble: bool,
+    use_amplitude_dynamic_scaling: bool,
+) -> int:
+    units = target_bars + (n_boot * 10)
+    if run_cross_asset:
+        units += target_bars
+    if use_amplitude_ensemble:
+        units += target_bars
+    if use_amplitude_dynamic_scaling:
+        units += target_bars * 8
+        units += n_boot * 25
+    return units
 
 
 def apply_feature_filters(
@@ -885,14 +928,14 @@ amplitude_span = st.sidebar.slider("Amplitude search span", 2, 20, 6, step=2)
 amplitude_step = st.sidebar.select_slider("Amplitude search step", options=[1.0, 2.0, 3.0, 5.0], value=1.0)
 amplitude_tinactive = st.sidebar.slider("Amplitude inactivity bars", 3, 48, 10, step=1)
 use_amplitude_ensemble = st.sidebar.checkbox("Use multi-threshold amplitude ensemble", value=True)
-use_amplitude_dynamic_scaling = st.sidebar.checkbox("Use volatility-aware amplitude scaling", value=True)
+use_amplitude_dynamic_scaling = st.sidebar.checkbox("Use volatility-aware amplitude scaling", value=False)
 ensemble_width = st.sidebar.slider("Amplitude ensemble width", 1, 4, 2, step=1)
 use_oos = st.sidebar.checkbox("Use final holdout", value=True)
 oos_pct = st.sidebar.slider("Holdout %", 20, 45, 35, step=5)
-n_boot = st.sidebar.slider("Bootstrap runs", 100, 800, 300, step=50)
+n_boot = st.sidebar.slider("Bootstrap runs", 50, 800, 100, step=50)
 bootstrap_mode = st.sidebar.selectbox("Bootstrap mode", ["Block bootstrap", "IID bootstrap"], index=0)
 block_size = st.sidebar.slider("Bootstrap block size", 12, 168, 48, step=12)
-run_cross_asset = st.sidebar.checkbox("Run cross-asset check (ETH/USD)", value=True)
+run_cross_asset = st.sidebar.checkbox("Run cross-asset check (ETH/USD)", value=False)
 use_vwap_filter = st.sidebar.checkbox("Use VWAP confirmation", value=True)
 use_ema_filter = st.sidebar.checkbox("Use EMA slope confirmation", value=True)
 use_volume_filter = st.sidebar.checkbox("Use volume z-score filter", value=False)
@@ -934,7 +977,7 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     )
     if fetch_attempts:
         with st.expander("Fetch diagnostics"):
-            st.dataframe(pd.DataFrame(fetch_attempts), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(fetch_attempts), width="stretch", hide_index=True)
 
     st.subheader("Latest Live Feature Snapshot")
     live_cols = st.columns(4)
@@ -977,6 +1020,19 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         train_df = feat_df.reset_index(drop=True)
         test_df = feat_df.reset_index(drop=True)
         st.warning("Holdout is disabled. Any score below is in-sample and should not be trusted as evidence.")
+
+    workload_units = estimate_workload_units(
+        target_bars,
+        n_boot,
+        run_cross_asset,
+        use_amplitude_ensemble,
+        use_amplitude_dynamic_scaling,
+    )
+    if workload_units > 12000:
+        st.warning(
+            "This configuration is heavy and may feel slow on Streamlit Cloud. "
+            "Try lower bootstrap runs, disable cross-asset, or turn off dynamic amplitude scaling."
+        )
 
     amplitude_signal_kind = "amplitude_ensemble" if use_amplitude_ensemble else "amplitude"
 
@@ -1229,13 +1285,13 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     report_df = pd.DataFrame(
         [{"check": label, "result": "PASS" if ok else "FAIL"} for label, ok in report_checks]
     )
-    st.dataframe(report_df, use_container_width=True, hide_index=True)
+    st.dataframe(report_df, width="stretch", hide_index=True)
 
     st.subheader("Wavelet Window Search")
-    st.dataframe(wavelet_score_df, use_container_width=True, hide_index=True)
+    st.dataframe(wavelet_score_df, width="stretch", hide_index=True)
 
     st.subheader("Amplitude Threshold Search")
-    st.dataframe(amplitude_score_df, use_container_width=True, hide_index=True)
+    st.dataframe(amplitude_score_df, width="stretch", hide_index=True)
 
     st.subheader("Strategy Comparison")
     compare_df = pd.DataFrame(
@@ -1248,7 +1304,7 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
             {"strategy": "24/72 MA crossover", "sharpe": ma_sharpe},
         ]
     )
-    st.dataframe(compare_df, use_container_width=True, hide_index=True)
+    st.dataframe(compare_df, width="stretch", hide_index=True)
 
     filter_state_df = pd.DataFrame(
         [
@@ -1263,11 +1319,11 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         ]
     )
     st.subheader("Filter Configuration")
-    st.dataframe(filter_state_df, use_container_width=True, hide_index=True)
+    st.dataframe(filter_state_df, width="stretch", hide_index=True)
 
     if cross_asset_rows:
         st.subheader("Cross-Asset Check")
-        st.dataframe(pd.DataFrame(cross_asset_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(cross_asset_rows), width="stretch", hide_index=True)
 
     st.subheader("Filtered Equity Curves")
     chart_label = "Holdout Equity" if use_oos else "In-sample Equity"
@@ -1278,7 +1334,7 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
                 f"Amplitude {chart_label}": amplitude_filtered_equity,
             }
         ),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.caption(
