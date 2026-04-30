@@ -1364,3 +1364,37 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
             display_snapshots[
                 ["snapshot_dt", "exchange", "symbol", "orderbook_imbalance", "vwap_gap", "ema_slope", "volume_z"]
             ],
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.subheader("Filtered Equity Curves")
+    chart_label = "Holdout Equity" if use_oos else "In-sample Equity"
+    st.line_chart(
+        pd.DataFrame(
+            {
+                f"Wavelet {chart_label}": wavelet_filtered_equity,
+                f"Amplitude {chart_label}": amplitude_filtered_equity,
+            }
+        ),
+        width="stretch",
+    )
+
+    st.subheader("Deployment Verdict")
+    amplitude_passes = sum(1 for _, ok in amplitude_report_checks if ok)
+    amplitude_total = len(amplitude_report_checks)
+    if amplitude_passes >= deployment_gate:
+        st.success(
+            f"Amplitude is the main candidate and currently clears the deployment gate at {amplitude_passes}/{amplitude_total} checks."
+        )
+    else:
+        st.warning(
+            f"Amplitude is the main candidate but is not deployable yet: {amplitude_passes}/{amplitude_total} checks passed, gate is {deployment_gate}/{amplitude_total}."
+        )
+
+    st.caption(
+        "Amplitude is treated as the main strategy candidate. Wavelet is retained as a benchmark and auxiliary comparison. "
+        "Candles and live orderbook feature snapshots are stored in SQLite so we can re-test once enough real snapshots accumulate."
+    )
+else:
+    st.info("Click the button to fetch real BTC data and run the feature-filtered validation pass.")
