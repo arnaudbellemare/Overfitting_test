@@ -9,19 +9,19 @@ import streamlit as st
 
 
 TIMEFRAME = "1h"
-SYMBOL = "BTC/USD"
-MS_PER_HOUR = 60 * 60 * 1000
+PRIMARY_SYMBOL = "BTC/USD"
+SECONDARY_SYMBOLS = ["ETH/USD"]
 PERIODS_PER_YEAR = 252 * 24
 FETCH_EXCHANGES = [
-    {"id": "kraken", "symbol": "BTC/USD", "limit": 720},
-    {"id": "coinbase", "symbol": "BTC/USD", "limit": 300},
-    {"id": "bitstamp", "symbol": "BTC/USD", "limit": 1000},
+    {"id": "kraken", "symbol": PRIMARY_SYMBOL, "limit": 720},
+    {"id": "coinbase", "symbol": PRIMARY_SYMBOL, "limit": 300},
+    {"id": "bitstamp", "symbol": PRIMARY_SYMBOL, "limit": 1000},
 ]
 
 
 st.set_page_config(page_title="Real BTC Wavelet Test", layout="wide")
 st.title("Causal Wavelet + Honest BTC Validation")
-st.markdown("Live BTC/USD 1h data via ccxt with walk-forward training and true holdout testing.")
+st.markdown("Live BTC/USD 1h data via ccxt with baselines, block bootstrap, and cross-asset checks.")
 
 
 def _safe_sharpe(rets: np.ndarray, periods_per_year: int = PERIODS_PER_YEAR) -> float:
@@ -112,7 +112,9 @@ def _fetch_from_exchange(
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_real_btc_data(target_bars: int = 4000) -> Tuple[Optional[pd.DataFrame], Dict[str, str], List[Dict[str, str]]]:
+def fetch_market_data(
+    target_bars: int = 4000, symbol: str = PRIMARY_SYMBOL
+) -> Tuple[Optional[pd.DataFrame], Dict[str, str], List[Dict[str, str]]]:
     attempts: List[Dict[str, str]] = []
     best_df: Optional[pd.DataFrame] = None
     best_meta: Dict[str, str] = {}
@@ -120,7 +122,7 @@ def fetch_real_btc_data(target_bars: int = 4000) -> Tuple[Optional[pd.DataFrame]
     for cfg in FETCH_EXCHANGES:
         df, meta = _fetch_from_exchange(
             exchange_id=cfg["id"],
-            symbol=cfg["symbol"],
+            symbol=symbol,
             target_bars=target_bars,
             per_request_limit=cfg["limit"],
         )
@@ -137,7 +139,7 @@ def fetch_real_btc_data(target_bars: int = 4000) -> Tuple[Optional[pd.DataFrame]
 
 
 @st.cache_data(show_spinner=False)
-def causal_wavelet_denoise(prices_tuple: tuple[float, ...], window_size: int) -> np.ndarray:
+def causal_wavelet_denoise(prices_tuple: Tuple[float, ...], window_size: int) -> np.ndarray:
     prices = np.asarray(prices_tuple, dtype=float)
     if prices.size == 0:
         return prices
@@ -227,16 +229,15 @@ def strategy_returns_from_labels(prices: np.ndarray, labels: np.ndarray, tc_bps:
     return strat_rets
 
 
-def evaluate_single_window(prices: np.ndarray, window_size: int, tc_bps: int) -> float:
-    min_required = max(window_size + 10, 300)
-    if prices.size < min_required:
-        return np.nan
-
-    denoised = causal_wavelet_denoise(tuple(prices), window_size)
-    w = _volatility_band(prices)
-    labels = auto_labeling(denoised, np.arange(prices.size), w)
-    strat_rets = strategy_returns_from_labels(prices, labels, tc_bps)
-    return _safe_sharpe(strat_rets)
+def final_oos_returns(
+    train_prices: np.ndarray, test_prices: np.ndarray, window_size: int, tc_bps: int
+) -> np.ndarray:
+    combined = np.concatenate([train_prices[-window_size:], test_prices])
+    denoised = causal_wavelet_denoise(tuple(combined), window_size)
+    denoised_test = denoised[window_size:]
+    w = _volatility_band(train_prices)
+    labels = auto_labeling(denoised_test, np.arange(denoised_test.size), w)
+    return strategy_returns_from_labels(test_prices, labels, tc_bps)
 
 
 def walk_forward_score(
@@ -247,14 +248,14 @@ def walk_forward_score(
     min_train_bars: int = 800,
     test_bars: int = 240,
 ) -> float:
-    fold_scores: list[float] = []
+    fold_scores: List[float] = []
     n = prices.size
-    first_test_end = n_splits * test_bars
+    total_test_bars = n_splits * test_bars
 
-    if n < min_train_bars + first_test_end:
+    if n < min_train_bars + total_test_bars:
         return np.nan
 
-    train_end = n - first_test_end
+    train_end = n - total_test_bars
     for _ in range(n_splits):
         test_end = train_end + test_bars
         train_slice = prices[:train_end]
@@ -263,21 +264,14 @@ def walk_forward_score(
         if test_slice.size < test_bars or train_slice.size < max(min_train_bars, window_size + 10):
             return np.nan
 
-        combined = np.concatenate([train_slice[-window_size:], test_slice])
-        denoised = causal_wavelet_denoise(tuple(combined), window_size)
-        denoised_test = denoised[window_size:]
-        w = _volatility_band(train_slice)
-        labels = auto_labeling(denoised_test, np.arange(denoised_test.size), w)
-        rets = strategy_returns_from_labels(test_slice, labels, tc_bps)
+        rets = final_oos_returns(train_slice, test_slice, window_size, tc_bps)
         score = _safe_sharpe(rets)
         if np.isnan(score):
             return np.nan
         fold_scores.append(score)
         train_end = test_end
 
-    if not fold_scores:
-        return np.nan
-    return float(np.mean(fold_scores))
+    return float(np.mean(fold_scores)) if fold_scores else np.nan
 
 
 def prices_from_resampled_returns(base_prices: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -289,8 +283,55 @@ def prices_from_resampled_returns(base_prices: np.ndarray, rng: np.random.Genera
     return prices
 
 
+def prices_from_block_bootstrap(
+    base_prices: np.ndarray, rng: np.random.Generator, block_size: int
+) -> np.ndarray:
+    orig_rets = base_prices[1:] / base_prices[:-1] - 1.0
+    if orig_rets.size == 0:
+        return base_prices.copy()
+
+    block_size = max(2, min(block_size, orig_rets.size))
+    blocks: List[np.ndarray] = []
+    needed = orig_rets.size
+
+    while sum(block.size for block in blocks) < needed:
+        start = int(rng.integers(0, max(1, orig_rets.size - block_size + 1)))
+        block = orig_rets[start : start + block_size]
+        if block.size == 0:
+            continue
+        blocks.append(block)
+
+    boot_rets = np.concatenate(blocks)[:needed]
+    prices = np.empty(base_prices.size, dtype=float)
+    prices[0] = base_prices[0]
+    prices[1:] = prices[0] * np.cumprod(1.0 + boot_rets)
+    return prices
+
+
+def buy_and_hold_returns(prices: np.ndarray) -> np.ndarray:
+    return prices[1:] / prices[:-1] - 1.0
+
+
+def moving_average_crossover_returns(
+    prices: np.ndarray, tc_bps: int, fast_window: int = 24, slow_window: int = 72
+) -> np.ndarray:
+    if prices.size <= slow_window + 1:
+        return np.array([])
+
+    series = pd.Series(prices)
+    fast_ma = series.rolling(fast_window).mean()
+    slow_ma = series.rolling(slow_window).mean()
+    pos = np.where(fast_ma > slow_ma, 1.0, -1.0)
+    pos = pd.Series(pos).fillna(0.0).to_numpy()
+    rets = buy_and_hold_returns(prices)
+    strat = pos[:-1] * rets
+    position_changes = np.abs(np.diff(np.concatenate(([0.0], pos[:-1])))) > 0
+    strat[position_changes] -= tc_bps / 10000.0
+    return strat
+
+
 def choose_best_window(
-    prices: np.ndarray, candidate_windows: list[int], tc_bps: int
+    prices: np.ndarray, candidate_windows: List[int], tc_bps: int
 ) -> Tuple[Optional[int], pd.DataFrame]:
     rows = []
     for window in candidate_windows:
@@ -307,13 +348,34 @@ def choose_best_window(
     return int(score_df.iloc[0]["window"]), score_df
 
 
-def final_oos_returns(train_prices: np.ndarray, test_prices: np.ndarray, window_size: int, tc_bps: int) -> np.ndarray:
-    combined = np.concatenate([train_prices[-window_size:], test_prices])
-    denoised = causal_wavelet_denoise(tuple(combined), window_size)
-    denoised_test = denoised[window_size:]
-    w = _volatility_band(train_prices)
-    labels = auto_labeling(denoised_test, np.arange(denoised_test.size), w)
-    return strategy_returns_from_labels(test_prices, labels, tc_bps)
+def evaluate_cross_asset(
+    target_bars: int,
+    symbol: str,
+    best_win: int,
+    tc_bps: int,
+    oos_pct: int,
+) -> Dict[str, object]:
+    df, meta, attempts = fetch_market_data(target_bars, symbol)
+    min_needed = max(1200, best_win + 300)
+    result: Dict[str, object] = {
+        "symbol": symbol,
+        "exchange": meta.get("exchange", ""),
+        "status": "ok",
+        "attempts": attempts,
+    }
+
+    if df is None or len(df) < min_needed:
+        result["status"] = "insufficient_data"
+        return result
+
+    prices = df["close"].to_numpy(dtype=float)
+    split_idx = int(len(prices) * (1 - oos_pct / 100))
+    train_prices = prices[:split_idx]
+    test_prices = prices[split_idx:]
+    rets = final_oos_returns(train_prices, test_prices, best_win, tc_bps)
+    result["holdout_sharpe"] = _safe_sharpe(rets)
+    result["bars"] = len(df)
+    return result
 
 
 st.sidebar.header("Settings")
@@ -325,11 +387,14 @@ window_step = st.sidebar.select_slider("Window search step", options=[10, 20, 30
 use_oos = st.sidebar.checkbox("Use final holdout", value=True)
 oos_pct = st.sidebar.slider("Holdout %", 20, 45, 35, step=5)
 n_boot = st.sidebar.slider("Bootstrap runs", 100, 800, 300, step=50)
+bootstrap_mode = st.sidebar.selectbox("Bootstrap mode", ["Block bootstrap", "IID bootstrap"], index=0)
+block_size = st.sidebar.slider("Bootstrap block size", 12, 168, 48, step=12)
+run_cross_asset = st.sidebar.checkbox("Run cross-asset check (ETH/USD)", value=True)
 
 
 if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     with st.spinner("Fetching BTC/USD candles from available exchanges..."):
-        df, fetch_meta, fetch_attempts = fetch_real_btc_data(target_bars)
+        df, fetch_meta, fetch_attempts = fetch_market_data(target_bars, PRIMARY_SYMBOL)
 
     min_needed = max(1200, fixed_window + 300)
     if df is None or len(df) < min_needed:
@@ -379,33 +444,32 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     train_cv_sharpe = float(score_df.iloc[0]["walk_forward_sharpe"])
 
     if use_oos:
-        oos_rets = final_oos_returns(train_prices, test_prices, best_win, tc_bps)
-        oos_sharpe = _safe_sharpe(oos_rets)
-        equity = np.cumprod(1.0 + np.concatenate(([0.0], oos_rets)))
+        wavelet_rets = final_oos_returns(train_prices, test_prices, best_win, tc_bps)
+        wavelet_sharpe = _safe_sharpe(wavelet_rets)
+        equity = np.cumprod(1.0 + np.concatenate(([0.0], wavelet_rets)))
     else:
-        oos_rets = strategy_returns_from_labels(
-            train_prices,
-            auto_labeling(
-                causal_wavelet_denoise(tuple(train_prices), best_win),
-                np.arange(train_prices.size),
-                _volatility_band(train_prices),
-            ),
-            tc_bps,
-        )
-        oos_sharpe = _safe_sharpe(oos_rets)
-        equity = np.cumprod(1.0 + np.concatenate(([0.0], oos_rets)))
+        denoised = causal_wavelet_denoise(tuple(train_prices), best_win)
+        labels = auto_labeling(denoised, np.arange(train_prices.size), _volatility_band(train_prices))
+        wavelet_rets = strategy_returns_from_labels(train_prices, labels, tc_bps)
+        wavelet_sharpe = _safe_sharpe(wavelet_rets)
+        equity = np.cumprod(1.0 + np.concatenate(([0.0], wavelet_rets)))
+
+    benchmark_prices = test_prices if use_oos else train_prices
+    buy_hold_rets = buy_and_hold_returns(benchmark_prices)
+    ma_rets = moving_average_crossover_returns(benchmark_prices, tc_bps)
+    buy_hold_sharpe = _safe_sharpe(buy_hold_rets)
+    ma_sharpe = _safe_sharpe(ma_rets)
 
     rng = np.random.default_rng(12345)
     progress_bar = st.progress(0, text="Running bootstrap under the null...")
     best_boot = np.empty(n_boot, dtype=float)
     for i in range(n_boot):
-        boot_prices = prices_from_resampled_returns(train_prices, rng)
+        if bootstrap_mode == "Block bootstrap":
+            boot_prices = prices_from_block_bootstrap(train_prices, rng, block_size)
+        else:
+            boot_prices = prices_from_resampled_returns(train_prices, rng)
         boot_best_win, boot_scores = choose_best_window(boot_prices, candidate_windows, tc_bps)
-        best_boot[i] = (
-            float(boot_scores.iloc[0]["walk_forward_sharpe"])
-            if boot_best_win is not None
-            else np.nan
-        )
+        best_boot[i] = float(boot_scores.iloc[0]["walk_forward_sharpe"]) if boot_best_win is not None else np.nan
         progress_bar.progress((i + 1) / n_boot)
     progress_bar.empty()
 
@@ -413,34 +477,80 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     p_value = float(np.mean(valid_boot >= train_cv_sharpe)) if valid_boot.size else np.nan
     q95 = float(np.quantile(valid_boot, 0.95)) if valid_boot.size else np.nan
 
-    col1, col2, col3 = st.columns(3)
+    cross_asset_rows: List[Dict[str, object]] = []
+    if run_cross_asset and use_oos:
+        with st.spinner("Running cross-asset validation..."):
+            for symbol in SECONDARY_SYMBOLS:
+                cross_asset_rows.append(
+                    evaluate_cross_asset(target_bars, symbol, best_win, tc_bps, oos_pct)
+                )
+
+    report_checks = [
+        ("Train CV > bootstrap 95%", bool(not np.isnan(q95) and train_cv_sharpe > q95)),
+        ("Holdout Sharpe > 0", bool(not np.isnan(wavelet_sharpe) and wavelet_sharpe > 0)),
+        ("Beat buy-and-hold", bool(not np.isnan(wavelet_sharpe) and not np.isnan(buy_hold_sharpe) and wavelet_sharpe > buy_hold_sharpe)),
+        ("Beat MA baseline", bool(not np.isnan(wavelet_sharpe) and not np.isnan(ma_sharpe) and wavelet_sharpe > ma_sharpe)),
+    ]
+    if cross_asset_rows:
+        cross_asset_ok = any(
+            row.get("status") == "ok" and not np.isnan(row.get("holdout_sharpe", np.nan)) and row.get("holdout_sharpe", np.nan) > 0
+            for row in cross_asset_rows
+        )
+        report_checks.append(("Positive on secondary asset", cross_asset_ok))
+
+    passed_checks = sum(1 for _, ok in report_checks if ok)
+    total_checks = len(report_checks)
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Selected window", f"{best_win} bars")
         st.metric("Train CV Sharpe", f"{train_cv_sharpe:.4f}")
     with col2:
-        st.metric("Holdout Sharpe" if use_oos else "In-sample Sharpe", f"{oos_sharpe:.4f}")
+        st.metric("Wavelet Sharpe", f"{wavelet_sharpe:.4f}")
         st.metric("Bootstrap p-value", "n/a" if np.isnan(p_value) else f"{p_value:.1%}")
     with col3:
-        st.metric("Train bars", f"{len(train_prices)}")
-        st.metric("Holdout bars" if use_oos else "Scored bars", f"{len(test_prices)}")
+        st.metric("Buy/Hold Sharpe", f"{buy_hold_sharpe:.4f}")
+        st.metric("MA Sharpe", f"{ma_sharpe:.4f}")
+    with col4:
+        st.metric("Checks passed", f"{passed_checks}/{total_checks}")
+        st.metric("Bootstrap mode", "block" if bootstrap_mode == "Block bootstrap" else "iid")
+
+    st.subheader("Pass / Fail Report")
+    report_df = pd.DataFrame(
+        [{"check": label, "result": "PASS" if ok else "FAIL"} for label, ok in report_checks]
+    )
+    st.dataframe(report_df, use_container_width=True, hide_index=True)
+
+    if passed_checks == total_checks:
+        st.success("This run passed every configured robustness check.")
+    elif passed_checks >= max(2, total_checks - 1):
+        st.warning("This run is somewhat promising, but at least one robustness check still failed.")
+    else:
+        st.error("This run looks fragile. The strategy is not surviving enough robustness checks yet.")
 
     st.subheader("Window Search Results")
     st.dataframe(score_df, use_container_width=True, hide_index=True)
 
-    if not np.isnan(q95):
-        if train_cv_sharpe > q95 and use_oos and oos_sharpe > 0:
-            st.success("The model cleared the bootstrap threshold on training CV and stayed positive on the holdout.")
-        elif use_oos and oos_sharpe <= 0:
-            st.warning("The selected window did not hold up on the final holdout. Treat this as likely overfitting.")
-        else:
-            st.warning("The training CV edge is not clearly above the bootstrap null. This still looks fragile.")
+    st.subheader("Baseline Comparison")
+    baseline_df = pd.DataFrame(
+        [
+            {"strategy": "Wavelet labels", "sharpe": wavelet_sharpe},
+            {"strategy": "Buy and hold", "sharpe": buy_hold_sharpe},
+            {"strategy": "24/72 MA crossover", "sharpe": ma_sharpe},
+        ]
+    )
+    st.dataframe(baseline_df, use_container_width=True, hide_index=True)
+
+    if cross_asset_rows:
+        st.subheader("Cross-Asset Check")
+        st.dataframe(pd.DataFrame(cross_asset_rows), use_container_width=True, hide_index=True)
 
     st.subheader("Equity Curve")
     chart_label = "Holdout Equity" if use_oos else "In-sample Equity"
     st.line_chart(pd.DataFrame({chart_label: equity}), use_container_width=True)
 
     st.caption(
-        "Fetch source: exchange selected via ccxt. Window selection uses only the training set. Holdout evaluation is performed once after selection."
+        "Window selection uses only the training set. Final holdout, baselines, bootstrap, and cross-asset checks are reported separately."
     )
 else:
     st.info("Click the button to fetch real BTC data and run a stricter validation pass.")
