@@ -354,6 +354,107 @@ def auto_labeling(data: np.ndarray, timestamps: np.ndarray, w: float) -> np.ndar
     return np.where(labels == 0, cid, labels)
 
 
+def amplitude_segment_labels(
+    feature_df: pd.DataFrame, minamp: float, tinactive: int, scale: float = 1e4
+) -> np.ndarray:
+    prices = feature_df["close"].to_numpy(dtype=float)
+    n = prices.size
+    if n == 0:
+        return np.array([], dtype=float)
+
+    cumr = np.log(prices / prices[0]) * scale
+    labels = np.zeros(n, dtype=float)
+    epsilon = 1e-6
+
+    istart = 0
+    icursor = 0
+    imin = 0
+    imax = 0
+    vmin = cumr[0]
+    vmax = cumr[0]
+
+    while icursor < n:
+        v = cumr[icursor]
+        if (vmax - vmin) + epsilon >= minamp and imin > imax and (v - vmin) + epsilon >= minamp:
+            labels[istart:imax] = 0.0
+            labels[imax : imin + 1] = -1.0
+            istart = imin
+            imax = icursor
+            vmax = v
+        elif (vmax - vmin) + epsilon >= minamp and imax > imin and (vmax - v) + epsilon >= minamp:
+            labels[istart:imin] = 0.0
+            labels[imin : imax + 1] = 1.0
+            istart = imax
+            imin = icursor
+            vmin = v
+        elif imax > imin and (icursor - imax) >= tinactive and v <= vmax:
+            if (vmax - vmin) + epsilon >= minamp:
+                labels[istart:imin] = 0.0
+                labels[imin : imax + 1] = 1.0
+                labels[imax + 1 : icursor + 1] = 0.0
+            else:
+                labels[istart : icursor + 1] = 0.0
+            istart = icursor
+            imax = icursor
+            imin = icursor
+            vmax = v
+            vmin = v
+        elif imin > imax and (icursor - imin) >= tinactive and v >= vmin:
+            if (vmax - vmin) + epsilon >= minamp:
+                labels[istart:imax] = 0.0
+                labels[imax : imin + 1] = -1.0
+                labels[imin + 1 : icursor + 1] = 0.0
+            else:
+                labels[istart : icursor + 1] = 0.0
+            istart = icursor
+            imax = icursor
+            imin = icursor
+            vmax = v
+            vmin = v
+
+        if v >= vmax:
+            imax = icursor
+            vmax = v
+        if v <= vmin:
+            imin = icursor
+            vmin = v
+        icursor += 1
+
+    if (vmax - vmin) + epsilon >= minamp:
+        if imin > imax:
+            labels[istart:imax] = 0.0
+            labels[imax : imin + 1] = -1.0
+        elif imax > imin:
+            labels[istart:imin] = 0.0
+            labels[imin : imax + 1] = 1.0
+
+    ipos = 0
+    while ipos < n:
+        direction = labels[ipos]
+        if direction == 0.0:
+            ipos += 1
+            continue
+        seg_start = ipos
+        while ipos < n and labels[ipos] == direction:
+            ipos += 1
+        seg_end = ipos - 1
+        x = np.arange(seg_start, seg_end + 1) - seg_start
+        y = cumr[seg_start : seg_end + 1]
+        if y.size < 2 or np.any(np.isnan(y)) or np.any(np.isinf(y)):
+            labels[seg_start : seg_end + 1] = 0.0
+            continue
+        try:
+            beta = np.polyfit(x, y, 1)[0]
+        except Exception:
+            labels[seg_start : seg_end + 1] = 0.0
+            continue
+        max_dist = direction * beta * x
+        if np.max(max_dist) + epsilon < minamp:
+            labels[seg_start : seg_end + 1] = 0.0
+
+    return labels
+
+
 def apply_feature_filters(
     labels: np.ndarray,
     feature_df: pd.DataFrame,
@@ -394,17 +495,34 @@ def build_labels_and_features(prices: np.ndarray, feature_df: pd.DataFrame, wind
     return denoised, labels
 
 
+def build_signal_labels(
+    feature_df: pd.DataFrame,
+    signal_kind: str,
+    signal_param: float,
+    amplitude_tinactive: int,
+) -> np.ndarray:
+    prices = feature_df["close"].to_numpy(dtype=float)
+    if signal_kind == "wavelet":
+        _, labels = build_labels_and_features(prices, feature_df, int(signal_param))
+        return labels
+    if signal_kind == "amplitude":
+        return amplitude_segment_labels(feature_df, float(signal_param), amplitude_tinactive)
+    raise ValueError(f"Unsupported signal kind: {signal_kind}")
+
+
 def compute_strategy_returns(
     feature_df: pd.DataFrame,
-    window_size: int,
+    signal_kind: str,
+    signal_param: float,
     tc_bps: int,
     use_vwap_filter: bool,
     use_ema_filter: bool,
     use_volume_filter: bool,
     min_volume_z: float,
+    amplitude_tinactive: int,
 ) -> Dict[str, np.ndarray]:
     prices = feature_df["close"].to_numpy(dtype=float)
-    _, raw_labels = build_labels_and_features(prices, feature_df, window_size)
+    raw_labels = build_signal_labels(feature_df, signal_kind, signal_param, amplitude_tinactive)
     filtered_labels = apply_feature_filters(
         raw_labels,
         feature_df,
@@ -424,18 +542,20 @@ def compute_strategy_returns(
 def final_oos_strategy_returns(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
-    window_size: int,
+    signal_kind: str,
+    signal_param: float,
     tc_bps: int,
     use_vwap_filter: bool,
     use_ema_filter: bool,
     use_volume_filter: bool,
     min_volume_z: float,
+    amplitude_tinactive: int,
 ) -> Dict[str, np.ndarray]:
-    combined = pd.concat([train_df.tail(window_size), test_df], ignore_index=True)
-    combined_prices = combined["close"].to_numpy(dtype=float)
-    _, all_labels = build_labels_and_features(combined_prices, combined, window_size)
-    test_labels = all_labels[window_size:]
-    test_features = combined.iloc[window_size:].reset_index(drop=True)
+    overlap = int(signal_param) if signal_kind == "wavelet" else 0
+    combined = pd.concat([train_df.tail(overlap), test_df], ignore_index=True)
+    all_labels = build_signal_labels(combined, signal_kind, signal_param, amplitude_tinactive)
+    test_labels = all_labels[overlap:]
+    test_features = combined.iloc[overlap:].reset_index(drop=True)
     filtered_labels = apply_feature_filters(
         test_labels,
         test_features,
@@ -455,12 +575,14 @@ def final_oos_strategy_returns(
 
 def walk_forward_score(
     feature_df: pd.DataFrame,
-    window_size: int,
+    signal_kind: str,
+    signal_param: float,
     tc_bps: int,
     use_vwap_filter: bool,
     use_ema_filter: bool,
     use_volume_filter: bool,
     min_volume_z: float,
+    amplitude_tinactive: int,
     n_splits: int = 4,
     min_train_bars: int = 800,
     test_bars: int = 240,
@@ -476,18 +598,21 @@ def walk_forward_score(
         test_end = train_end + test_bars
         train_slice = feature_df.iloc[:train_end].reset_index(drop=True)
         test_slice = feature_df.iloc[train_end:test_end].reset_index(drop=True)
-        if len(test_slice) < test_bars or len(train_slice) < max(min_train_bars, window_size + 10):
+        overlap = int(signal_param) if signal_kind == "wavelet" else 0
+        if len(test_slice) < test_bars or len(train_slice) < max(min_train_bars, overlap + 10):
             return np.nan
 
         rets = final_oos_strategy_returns(
             train_slice,
             test_slice,
-            window_size,
+            signal_kind,
+            signal_param,
             tc_bps,
             use_vwap_filter,
             use_ema_filter,
             use_volume_filter,
             min_volume_z,
+            amplitude_tinactive,
         )["filtered"]
         score = _safe_sharpe(rets)
         if np.isnan(score):
@@ -568,51 +693,61 @@ def moving_average_crossover_returns(
     return strat
 
 
-def choose_best_window(
+def choose_best_param(
     feature_df: pd.DataFrame,
-    candidate_windows: List[int],
+    candidate_params: List[float],
+    signal_kind: str,
     tc_bps: int,
     use_vwap_filter: bool,
     use_ema_filter: bool,
     use_volume_filter: bool,
     min_volume_z: float,
+    amplitude_tinactive: int,
 ) -> Tuple[Optional[int], pd.DataFrame]:
     rows = []
-    for window in candidate_windows:
+    for param in candidate_params:
         score = walk_forward_score(
             feature_df,
-            window,
+            signal_kind,
+            param,
             tc_bps,
             use_vwap_filter,
             use_ema_filter,
             use_volume_filter,
             min_volume_z,
+            amplitude_tinactive,
         )
-        rows.append({"window": window, "walk_forward_sharpe": score})
+        rows.append({"param": param, "walk_forward_sharpe": score})
 
     score_df = pd.DataFrame(rows).sort_values(
-        by=["walk_forward_sharpe", "window"],
+        by=["walk_forward_sharpe", "param"],
         ascending=[False, True],
         na_position="last",
     )
     if score_df.empty or score_df["walk_forward_sharpe"].isna().all():
         return None, score_df
-    return int(score_df.iloc[0]["window"]), score_df
+    best_param = score_df.iloc[0]["param"]
+    if signal_kind == "wavelet":
+        return int(best_param), score_df
+    return float(best_param), score_df
 
 
 def evaluate_cross_asset(
     target_bars: int,
     symbol: str,
-    best_win: int,
+    signal_kind: str,
+    best_param: float,
     tc_bps: int,
     oos_pct: int,
     use_vwap_filter: bool,
     use_ema_filter: bool,
     use_volume_filter: bool,
     min_volume_z: float,
+    amplitude_tinactive: int,
 ) -> Dict[str, object]:
     df, meta, _ = fetch_market_data(target_bars, symbol)
-    min_needed = max(1200, best_win + 300)
+    overlap = int(best_param) if signal_kind == "wavelet" else 0
+    min_needed = max(1200, overlap + 300)
     result: Dict[str, object] = {
         "symbol": symbol,
         "exchange": meta.get("exchange", ""),
@@ -629,12 +764,14 @@ def evaluate_cross_asset(
     rets = final_oos_strategy_returns(
         train_df,
         test_df,
-        best_win,
+        signal_kind,
+        best_param,
         tc_bps,
         use_vwap_filter,
         use_ema_filter,
         use_volume_filter,
         min_volume_z,
+        amplitude_tinactive,
     )["filtered"]
     result["holdout_sharpe"] = _safe_sharpe(rets)
     result["bars"] = len(feat)
@@ -649,6 +786,10 @@ tc_bps = st.sidebar.slider("Transaction cost (bps)", 15, 40, 22, step=1)
 fixed_window = st.sidebar.number_input("Center window size", value=420, min_value=200, max_value=900, step=20)
 window_span = st.sidebar.slider("Window search span", 40, 240, 120, step=20)
 window_step = st.sidebar.select_slider("Window search step", options=[10, 20, 30, 40, 60], value=20)
+amplitude_center = st.sidebar.number_input("Center amplitude threshold", value=10.0, min_value=2.0, max_value=40.0, step=1.0)
+amplitude_span = st.sidebar.slider("Amplitude search span", 2, 20, 6, step=2)
+amplitude_step = st.sidebar.select_slider("Amplitude search step", options=[1.0, 2.0, 3.0, 5.0], value=1.0)
+amplitude_tinactive = st.sidebar.slider("Amplitude inactivity bars", 3, 48, 10, step=1)
 use_oos = st.sidebar.checkbox("Use final holdout", value=True)
 oos_pct = st.sidebar.slider("Holdout %", 20, 45, 35, step=5)
 n_boot = st.sidebar.slider("Bootstrap runs", 100, 800, 300, step=50)
@@ -720,6 +861,16 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
             )
         }
     )
+    candidate_amplitudes = sorted(
+        {
+            round(a, 4)
+            for a in np.arange(
+                max(2.0, amplitude_center - amplitude_span),
+                amplitude_center + amplitude_span + amplitude_step * 0.5,
+                amplitude_step,
+            )
+        }
+    )
 
     if use_oos:
         split_idx = int(len(feat_df) * (1 - oos_pct / 100))
@@ -730,52 +881,92 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         test_df = feat_df.reset_index(drop=True)
         st.warning("Holdout is disabled. Any score below is in-sample and should not be trusted as evidence.")
 
-    with st.spinner("Selecting the window using walk-forward validation on the training set..."):
-        best_win, score_df = choose_best_window(
+    with st.spinner("Selecting best wavelet and amplitude parameters on the training set..."):
+        best_win, wavelet_score_df = choose_best_param(
             train_df,
             candidate_windows,
+            "wavelet",
             tc_bps,
             use_vwap_filter,
             use_ema_filter,
             use_volume_filter,
             min_volume_z,
+            amplitude_tinactive,
+        )
+        best_amp, amplitude_score_df = choose_best_param(
+            train_df,
+            candidate_amplitudes,
+            "amplitude",
+            tc_bps,
+            use_vwap_filter,
+            use_ema_filter,
+            use_volume_filter,
+            min_volume_z,
+            amplitude_tinactive,
         )
 
-    if best_win is None:
-        st.error("Could not score the candidate windows. Increase target bars or reduce the search range.")
+    if best_win is None or best_amp is None:
+        st.error("Could not score one or more candidate parameter grids. Increase target bars or reduce the search range.")
         st.stop()
 
-    train_cv_sharpe = float(score_df.iloc[0]["walk_forward_sharpe"])
+    wavelet_train_cv_sharpe = float(wavelet_score_df.iloc[0]["walk_forward_sharpe"])
+    amplitude_train_cv_sharpe = float(amplitude_score_df.iloc[0]["walk_forward_sharpe"])
 
     if use_oos:
-        out = final_oos_strategy_returns(
+        wavelet_out = final_oos_strategy_returns(
             train_df,
             test_df,
+            "wavelet",
             best_win,
             tc_bps,
             use_vwap_filter,
             use_ema_filter,
             use_volume_filter,
             min_volume_z,
+            amplitude_tinactive,
         )
-        raw_rets = out["raw"]
-        filtered_rets = out["filtered"]
-    else:
-        out = compute_strategy_returns(
+        amplitude_out = final_oos_strategy_returns(
             train_df,
+            test_df,
+            "amplitude",
+            best_amp,
+            tc_bps,
+            use_vwap_filter,
+            use_ema_filter,
+            use_volume_filter,
+            min_volume_z,
+            amplitude_tinactive,
+        )
+    else:
+        wavelet_out = compute_strategy_returns(
+            train_df,
+            "wavelet",
             best_win,
             tc_bps,
             use_vwap_filter,
             use_ema_filter,
             use_volume_filter,
             min_volume_z,
+            amplitude_tinactive,
         )
-        raw_rets = out["raw"]
-        filtered_rets = out["filtered"]
+        amplitude_out = compute_strategy_returns(
+            train_df,
+            "amplitude",
+            best_amp,
+            tc_bps,
+            use_vwap_filter,
+            use_ema_filter,
+            use_volume_filter,
+            min_volume_z,
+            amplitude_tinactive,
+        )
 
-    raw_sharpe = _safe_sharpe(raw_rets)
-    filtered_sharpe = _safe_sharpe(filtered_rets)
-    filtered_equity = np.cumprod(1.0 + np.concatenate(([0.0], filtered_rets)))
+    wavelet_raw_sharpe = _safe_sharpe(wavelet_out["raw"])
+    wavelet_filtered_sharpe = _safe_sharpe(wavelet_out["filtered"])
+    amplitude_raw_sharpe = _safe_sharpe(amplitude_out["raw"])
+    amplitude_filtered_sharpe = _safe_sharpe(amplitude_out["filtered"])
+    wavelet_filtered_equity = np.cumprod(1.0 + np.concatenate(([0.0], wavelet_out["filtered"])))
+    amplitude_filtered_equity = np.cumprod(1.0 + np.concatenate(([0.0], amplitude_out["filtered"])))
 
     benchmark_prices = test_df["close"].to_numpy(dtype=float) if use_oos else train_df["close"].to_numpy(dtype=float)
     buy_hold_sharpe = _safe_sharpe(buy_and_hold_returns(benchmark_prices))
@@ -783,7 +974,8 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
 
     rng = np.random.default_rng(12345)
     progress_bar = st.progress(0, text="Running bootstrap under the null...")
-    best_boot = np.empty(n_boot, dtype=float)
+    wavelet_best_boot = np.empty(n_boot, dtype=float)
+    amplitude_best_boot = np.empty(n_boot, dtype=float)
     train_prices = train_df["close"].to_numpy(dtype=float)
     for i in range(n_boot):
         if bootstrap_mode == "Block bootstrap":
@@ -791,73 +983,133 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         else:
             boot_prices = prices_from_resampled_returns(train_prices, rng)
         boot_feat = feature_df_from_prices(boot_prices)
-        boot_best_win, boot_scores = choose_best_window(
+        boot_best_win, boot_wavelet_scores = choose_best_param(
             boot_feat,
             candidate_windows,
+            "wavelet",
             tc_bps,
             use_vwap_filter,
             use_ema_filter,
             use_volume_filter,
             min_volume_z,
+            amplitude_tinactive,
         )
-        best_boot[i] = float(boot_scores.iloc[0]["walk_forward_sharpe"]) if boot_best_win is not None else np.nan
+        boot_best_amp, boot_amplitude_scores = choose_best_param(
+            boot_feat,
+            candidate_amplitudes,
+            "amplitude",
+            tc_bps,
+            use_vwap_filter,
+            use_ema_filter,
+            use_volume_filter,
+            min_volume_z,
+            amplitude_tinactive,
+        )
+        wavelet_best_boot[i] = float(boot_wavelet_scores.iloc[0]["walk_forward_sharpe"]) if boot_best_win is not None else np.nan
+        amplitude_best_boot[i] = float(boot_amplitude_scores.iloc[0]["walk_forward_sharpe"]) if boot_best_amp is not None else np.nan
         progress_bar.progress((i + 1) / n_boot)
     progress_bar.empty()
 
-    valid_boot = best_boot[~np.isnan(best_boot)]
-    p_value = float(np.mean(valid_boot >= train_cv_sharpe)) if valid_boot.size else np.nan
-    q95 = float(np.quantile(valid_boot, 0.95)) if valid_boot.size else np.nan
+    valid_wavelet_boot = wavelet_best_boot[~np.isnan(wavelet_best_boot)]
+    valid_amplitude_boot = amplitude_best_boot[~np.isnan(amplitude_best_boot)]
+    wavelet_p_value = float(np.mean(valid_wavelet_boot >= wavelet_train_cv_sharpe)) if valid_wavelet_boot.size else np.nan
+    wavelet_q95 = float(np.quantile(valid_wavelet_boot, 0.95)) if valid_wavelet_boot.size else np.nan
+    amplitude_p_value = float(np.mean(valid_amplitude_boot >= amplitude_train_cv_sharpe)) if valid_amplitude_boot.size else np.nan
+    amplitude_q95 = float(np.quantile(valid_amplitude_boot, 0.95)) if valid_amplitude_boot.size else np.nan
 
     cross_asset_rows: List[Dict[str, object]] = []
     if run_cross_asset and use_oos:
         with st.spinner("Running cross-asset validation..."):
             for symbol in SECONDARY_SYMBOLS:
                 cross_asset_rows.append(
-                    evaluate_cross_asset(
-                        target_bars,
-                        symbol,
-                        best_win,
-                        tc_bps,
-                        oos_pct,
-                        use_vwap_filter,
-                        use_ema_filter,
-                        use_volume_filter,
-                        min_volume_z,
-                    )
+                    {
+                        "symbol": symbol,
+                        "wavelet_filtered_sharpe": evaluate_cross_asset(
+                            target_bars,
+                            symbol,
+                            "wavelet",
+                            best_win,
+                            tc_bps,
+                            oos_pct,
+                            use_vwap_filter,
+                            use_ema_filter,
+                            use_volume_filter,
+                            min_volume_z,
+                            amplitude_tinactive,
+                        ).get("holdout_sharpe", np.nan),
+                        "amplitude_filtered_sharpe": evaluate_cross_asset(
+                            target_bars,
+                            symbol,
+                            "amplitude",
+                            best_amp,
+                            tc_bps,
+                            oos_pct,
+                            use_vwap_filter,
+                            use_ema_filter,
+                            use_volume_filter,
+                            min_volume_z,
+                            amplitude_tinactive,
+                        ).get("holdout_sharpe", np.nan),
+                    }
                 )
 
-    report_checks = [
-        ("Train CV > bootstrap 95%", bool(not np.isnan(q95) and train_cv_sharpe > q95)),
-        ("Filtered holdout Sharpe > 0", bool(not np.isnan(filtered_sharpe) and filtered_sharpe > 0)),
-        ("Filtered > raw wavelet", bool(not np.isnan(filtered_sharpe) and not np.isnan(raw_sharpe) and filtered_sharpe > raw_sharpe)),
-        ("Filtered > buy-and-hold", bool(not np.isnan(filtered_sharpe) and not np.isnan(buy_hold_sharpe) and filtered_sharpe > buy_hold_sharpe)),
-        ("Filtered > MA baseline", bool(not np.isnan(filtered_sharpe) and not np.isnan(ma_sharpe) and filtered_sharpe > ma_sharpe)),
-    ]
-    if cross_asset_rows:
-        cross_asset_ok = any(
-            row.get("status") == "ok"
-            and not np.isnan(row.get("holdout_sharpe", np.nan))
-            and row.get("holdout_sharpe", np.nan) > 0
-            for row in cross_asset_rows
-        )
-        report_checks.append(("Positive on secondary asset", cross_asset_ok))
+    def build_report_checks(
+        name: str,
+        train_cv_sharpe: float,
+        q95: float,
+        raw_sharpe: float,
+        filtered_sharpe: float,
+    ) -> List[Tuple[str, bool]]:
+        checks = [
+            (f"{name}: Train CV > bootstrap 95%", bool(not np.isnan(q95) and train_cv_sharpe > q95)),
+            (f"{name}: Filtered holdout Sharpe > 0", bool(not np.isnan(filtered_sharpe) and filtered_sharpe > 0)),
+            (f"{name}: Filtered > raw", bool(not np.isnan(filtered_sharpe) and not np.isnan(raw_sharpe) and filtered_sharpe > raw_sharpe)),
+            (f"{name}: Filtered > buy-and-hold", bool(not np.isnan(filtered_sharpe) and not np.isnan(buy_hold_sharpe) and filtered_sharpe > buy_hold_sharpe)),
+            (f"{name}: Filtered > MA baseline", bool(not np.isnan(filtered_sharpe) and not np.isnan(ma_sharpe) and filtered_sharpe > ma_sharpe)),
+        ]
+        if cross_asset_rows:
+            if name == "Wavelet":
+                cross_ok = any(not np.isnan(row.get("wavelet_filtered_sharpe", np.nan)) and row.get("wavelet_filtered_sharpe", np.nan) > 0 for row in cross_asset_rows)
+            else:
+                cross_ok = any(not np.isnan(row.get("amplitude_filtered_sharpe", np.nan)) and row.get("amplitude_filtered_sharpe", np.nan) > 0 for row in cross_asset_rows)
+            checks.append((f"{name}: Positive on secondary asset", cross_ok))
+        return checks
+
+    wavelet_report_checks = build_report_checks(
+        "Wavelet",
+        wavelet_train_cv_sharpe,
+        wavelet_q95,
+        wavelet_raw_sharpe,
+        wavelet_filtered_sharpe,
+    )
+    amplitude_report_checks = build_report_checks(
+        "Amplitude",
+        amplitude_train_cv_sharpe,
+        amplitude_q95,
+        amplitude_raw_sharpe,
+        amplitude_filtered_sharpe,
+    )
+    report_checks = wavelet_report_checks + amplitude_report_checks
 
     passed_checks = sum(1 for _, ok in report_checks if ok)
     total_checks = len(report_checks)
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Selected window", f"{best_win} bars")
-        st.metric("Train CV Sharpe", f"{train_cv_sharpe:.4f}")
+        st.metric("Wavelet window", f"{best_win} bars")
+        st.metric("Wavelet train CV", f"{wavelet_train_cv_sharpe:.4f}")
     with col2:
-        st.metric("Raw wavelet Sharpe", f"{raw_sharpe:.4f}")
-        st.metric("Filtered Sharpe", f"{filtered_sharpe:.4f}")
+        st.metric("Amplitude threshold", f"{best_amp:.2f}")
+        st.metric("Amplitude train CV", f"{amplitude_train_cv_sharpe:.4f}")
     with col3:
         st.metric("Buy/Hold Sharpe", f"{buy_hold_sharpe:.4f}")
         st.metric("MA Sharpe", f"{ma_sharpe:.4f}")
     with col4:
         st.metric("Checks passed", f"{passed_checks}/{total_checks}")
-        st.metric("Bootstrap p-value", "n/a" if np.isnan(p_value) else f"{p_value:.1%}")
+        st.metric(
+            "Wavelet / Amp p-value",
+            f"{wavelet_p_value:.1%} / {amplitude_p_value:.1%}" if not (np.isnan(wavelet_p_value) or np.isnan(amplitude_p_value)) else "n/a",
+        )
 
     st.subheader("Pass / Fail Report")
     report_df = pd.DataFrame(
@@ -865,14 +1117,19 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
     )
     st.dataframe(report_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Window Search Results")
-    st.dataframe(score_df, use_container_width=True, hide_index=True)
+    st.subheader("Wavelet Window Search")
+    st.dataframe(wavelet_score_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Amplitude Threshold Search")
+    st.dataframe(amplitude_score_df, use_container_width=True, hide_index=True)
 
     st.subheader("Strategy Comparison")
     compare_df = pd.DataFrame(
         [
-            {"strategy": "Raw wavelet", "sharpe": raw_sharpe},
-            {"strategy": "Feature-filtered wavelet", "sharpe": filtered_sharpe},
+            {"strategy": "Raw wavelet", "sharpe": wavelet_raw_sharpe},
+            {"strategy": "Feature-filtered wavelet", "sharpe": wavelet_filtered_sharpe},
+            {"strategy": "Raw amplitude", "sharpe": amplitude_raw_sharpe},
+            {"strategy": "Feature-filtered amplitude", "sharpe": amplitude_filtered_sharpe},
             {"strategy": "Buy and hold", "sharpe": buy_hold_sharpe},
             {"strategy": "24/72 MA crossover", "sharpe": ma_sharpe},
         ]
@@ -885,6 +1142,7 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
             {"filter": "EMA slope confirmation", "enabled": use_ema_filter},
             {"filter": "Volume z-score", "enabled": use_volume_filter},
             {"filter": "Min volume z", "enabled": min_volume_z},
+            {"filter": "Amplitude inactivity bars", "enabled": amplitude_tinactive},
         ]
     )
     st.subheader("Filter Configuration")
@@ -894,12 +1152,20 @@ if st.button("Fetch Real BTC Data & Run Test", type="primary"):
         st.subheader("Cross-Asset Check")
         st.dataframe(pd.DataFrame(cross_asset_rows), use_container_width=True, hide_index=True)
 
-    st.subheader("Filtered Equity Curve")
+    st.subheader("Filtered Equity Curves")
     chart_label = "Holdout Equity" if use_oos else "In-sample Equity"
-    st.line_chart(pd.DataFrame({chart_label: filtered_equity}), use_container_width=True)
+    st.line_chart(
+        pd.DataFrame(
+            {
+                f"Wavelet {chart_label}": wavelet_filtered_equity,
+                f"Amplitude {chart_label}": amplitude_filtered_equity,
+            }
+        ),
+        use_container_width=True,
+    )
 
     st.caption(
-        "Candles and live feature snapshots are stored in SQLite. Historical backtests currently use candle-derived features only; live orderbook imbalance is logged for future out-of-sample research."
+        "Candles and live feature snapshots are stored in SQLite. Historical backtests currently use candle-derived features only; live orderbook imbalance is logged for future out-of-sample research. Wavelet and amplitude signals are both tested under the same holdout, bootstrap, baseline, and cross-asset framework."
     )
 else:
     st.info("Click the button to fetch real BTC data and run the feature-filtered validation pass.")
